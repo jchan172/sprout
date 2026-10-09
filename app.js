@@ -1,0 +1,591 @@
+/* Sprout PWA — baby growth tracker with WHO percentile curves.
+   Data persists in localStorage; works offline once installed. */
+'use strict';
+
+/* ---------------- utils ---------------- */
+function uid() {
+  if (typeof crypto !== 'undefined' && crypto.randomUUID) return crypto.randomUUID();
+  return 'id-' + Date.now().toString(36) + '-' + Math.floor(Math.random() * 1e9).toString(36);
+}
+function esc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+    return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+  });
+}
+function todayStr() {
+  const d = new Date();
+  return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+}
+function ageDays(birthStr, dateStr) {
+  return Math.round((Date.parse(dateStr + 'T00:00:00Z') - Date.parse(birthStr + 'T00:00:00Z')) / 86400000);
+}
+function fmtDate(str) {
+  const d = new Date(str + 'T00:00:00Z');
+  return d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric', timeZone: 'UTC' });
+}
+function ageString(birthStr, atStr) {
+  const days = ageDays(birthStr, atStr || todayStr());
+  const m = days / DAYS_PER_MONTH;
+  if (m < 1) return days === 1 ? '1 day' : days + ' days';
+  if (m < 24) return m.toFixed(1) + ' mo';
+  return (m / 12).toFixed(1) + ' yr';
+}
+
+/* ---------------- WHO math ---------------- */
+const DAYS_PER_MONTH = 30.4375;
+const CURVES = [
+  { label: '3rd', z: -1.880793608 },
+  { label: '15th', z: -1.036433389 },
+  { label: '50th', z: 0 },
+  { label: '85th', z: 1.036433389 },
+  { label: '97th', z: 1.880793608 }
+];
+
+function lmsAt(indicator, sex, day) {
+  if (day < 0 || day > WHO_MAX_DAYS) return null;
+  const key = { weight: 'wfa', length: 'lhfa', head: 'hcfa' }[indicator];
+  const t = key && WHO[key] && WHO[key][sex];
+  if (!t || day * 3 + 2 >= t.length) return null;
+  return [t[day * 3], t[day * 3 + 1], t[day * 3 + 2]];
+}
+function zScore(x, L, M, S) {
+  if (L === 0) return Math.log(x / M) / S;
+  return (Math.pow(x / M, L) - 1) / (L * S);
+}
+function phi(z) { // standard normal CDF, Abramowitz & Stegun 7.1.26
+  const t = 1 / (1 + 0.2316419 * Math.abs(z));
+  const d = 0.3989422804014327 * Math.exp(-z * z / 2);
+  const p = d * t * (0.319381530 + t * (-0.356563782 + t * (1.781477937 + t * (-1.821255978 + t * 1.330274429))));
+  return z > 0 ? 1 - p : p;
+}
+function percentileFor(x, L, M, S) { return phi(zScore(x, L, M, S)) * 100; }
+function curveValue(z, L, M, S) {
+  if (L === 0) return M * Math.exp(S * z);
+  return M * Math.pow(1 + L * S * z, 1 / L);
+}
+function ordinal(p) {
+  const n = Math.round(p);
+  let suf = 'th';
+  if (n % 100 < 11 || n % 100 > 13) {
+    if (n % 10 === 1) suf = 'st';
+    else if (n % 10 === 2) suf = 'nd';
+    else if (n % 10 === 3) suf = 'rd';
+  }
+  return n + suf;
+}
+
+/* ---------------- units ---------------- */
+function units() { return DB.units === 'metric' ? 'metric' : 'imperial'; }
+function dispWeight(kg) { return units() === 'metric' ? kg : kg * 2.20462; }
+function dispLength(cm) { return units() === 'metric' ? cm : cm / 2.54; }
+function toKg(v, unit) { return (unit || weightUnit()) === 'kg' ? v : v / 2.20462; }
+function toCm(v, unit) { return (unit || lengthUnit()) === 'cm' ? v : v * 2.54; }
+function weightUnit() { return units() === 'metric' ? 'kg' : 'lb'; }
+function lengthUnit() { return units() === 'metric' ? 'cm' : 'in'; }
+function fmtWeight(kg) { return dispWeight(kg).toFixed(1) + ' ' + weightUnit(); }
+function fmtLength(cm) { return dispLength(cm).toFixed(1) + ' ' + lengthUnit(); }
+function parseNum(str) {
+  const t = String(str == null ? '' : str).trim().replace(',', '.');
+  if (!t) return null;
+  const v = parseFloat(t);
+  return isFinite(v) && v > 0 ? v : NaN;
+}
+
+const INDICATORS = {
+  weight: { title: 'Weight', hint: 'Use a calibrated baby scale.', get: function (m) { return m.weightKg; },
+            fmt: fmtWeight, toMetric: toKg, unit: weightUnit, ph: 'e.g. 8.4' },
+  length: { title: 'Length', hint: 'Under 2: lying down. Over 2: standing.', get: function (m) { return m.lengthCm; },
+            fmt: fmtLength, toMetric: toCm, unit: lengthUnit, ph: 'e.g. 68.5' },
+  head:   { title: 'Head', hint: 'Tape around the widest part of the head.', get: function (m) { return m.headCm; },
+            fmt: fmtLength, toMetric: toCm, unit: lengthUnit, ph: 'e.g. 43.2' }
+};
+const IND_KEYS = ['weight', 'length', 'head'];
+
+/* ---------------- store (localStorage) ---------------- */
+const LS_KEY = 'sprout.v1';
+let DB = null;
+function defaultDB() { return { kids: [], measurements: [], units: 'imperial' }; }
+function loadDB() {
+  try {
+    const raw = localStorage.getItem(LS_KEY);
+    if (!raw) return defaultDB();
+    const d = JSON.parse(raw);
+    if (!d || !Array.isArray(d.kids) || !Array.isArray(d.measurements)) return defaultDB();
+    if (d.units !== 'metric' && d.units !== 'imperial') d.units = 'imperial';
+    return d;
+  } catch (e) { return defaultDB(); }
+}
+function saveDB() {
+  try { localStorage.setItem(LS_KEY, JSON.stringify(DB)); } catch (e) { /* storage full/blocked */ }
+}
+function getKid(id) { return DB.kids.find(function (k) { return k.id === id; }); }
+function kidMeasurements(kidId) {
+  return DB.measurements
+    .filter(function (m) { return m.kidId === kidId; })
+    .sort(function (a, b) { return a.date < b.date ? -1 : a.date > b.date ? 1 : 0; });
+}
+function latestFor(kidId, indKey) {
+  const ms = kidMeasurements(kidId);
+  for (let i = ms.length - 1; i >= 0; i--) {
+    if (INDICATORS[indKey].get(ms[i]) != null) return ms[i];
+  }
+  return null;
+}
+function percentileOf(kid, msr, indKey) {
+  const v = INDICATORS[indKey].get(msr);
+  if (v == null) return null;
+  const day = ageDays(kid.birth, msr.date);
+  const lms = lmsAt(indKey, kid.sex, day);
+  if (!lms) return null;
+  return percentileFor(v, lms[0], lms[1], lms[2]);
+}
+
+/* ---------------- view state ---------------- */
+let view = { name: 'kids' };
+let modal = null; // {type:'kid',kidId?} | {type:'msr',kidId,msrId?}
+
+/* ---------------- chart (SVG) ---------------- */
+function niceTicks(min, max, n) {
+  if (!(max > min)) return [min];
+  const span = max - min, raw = span / n;
+  const mag = Math.pow(10, Math.floor(Math.log10(raw)));
+  const norm = raw / mag;
+  const step = (norm >= 5 ? 5 : norm >= 2 ? 2 : 1) * mag;
+  const ticks = [];
+  for (let v = Math.ceil(min / step) * step; v <= max + 1e-9; v += step) ticks.push(+v.toFixed(6));
+  return ticks;
+}
+function chartSVG(kid, indKey, selectedId) {
+  const W = 640, H = 380, PL = 48, PR = 14, PT = 14, PB = 36;
+  const xMax = 61;
+  const toDisp = indKey === 'weight' ? dispWeight : dispLength;
+  const series = CURVES.map(function (c) {
+    const pts = [];
+    for (let d = 0; d <= WHO_MAX_DAYS; d += 16) {
+      const lms = lmsAt(indKey, kid.sex, d);
+      pts.push([d / DAYS_PER_MONTH, toDisp(curveValue(c.z, lms[0], lms[1], lms[2]))]);
+    }
+    return { label: c.label, pts: pts };
+  });
+  const p3 = series[0].pts, p97 = series[4].pts;
+  let lo = Infinity, hi = -Infinity;
+  p3.concat(p97).forEach(function (p) { lo = Math.min(lo, p[1]); hi = Math.max(hi, p[1]); });
+  const pad = (hi - lo) * 0.08;
+  lo -= pad; hi += pad;
+  const X = function (m) { return PL + (m / xMax) * (W - PL - PR); };
+  const Y = function (v) { return PT + (1 - (v - lo) / (hi - lo)) * (H - PT - PB); };
+  const f1 = function (n) { return Math.round(n * 10) / 10; };
+
+  let s = '<svg viewBox="0 0 ' + W + ' ' + H + '" role="img" aria-label="' + esc(INDICATORS[indKey].title) + ' growth chart">';
+  // band
+  let band = 'M' + p3.map(function (p) { return f1(X(p[0])) + ',' + f1(Y(p[1])); }).join('L');
+  band += 'L' + p97.slice().reverse().map(function (p) { return f1(X(p[0])) + ',' + f1(Y(p[1])); }).join('L') + 'Z';
+  s += '<path d="' + band + '" fill="#1a73e8" opacity="0.06"/>';
+  // gridlines + y labels
+  niceTicks(lo + pad, hi - pad, 5).forEach(function (t) {
+    s += '<line x1="' + PL + '" y1="' + f1(Y(t)) + '" x2="' + (W - PR) + '" y2="' + f1(Y(t)) + '" stroke="#e5e7eb"/>';
+    s += '<text x="' + (PL - 7) + '" y="' + f1(Y(t) + 4) + '" text-anchor="end" font-size="11" fill="#6b7280">' + Math.round(t) + '</text>';
+  });
+  // x labels
+  for (let m = 0; m <= 60; m += 6) {
+    const lbl = m === 0 ? 'Birth' : (m % 12 === 0 ? (m / 12) + 'y' : m + 'm');
+    s += '<text x="' + f1(X(m)) + '" y="' + (H - 12) + '" text-anchor="middle" font-size="11" fill="#6b7280">' + lbl + '</text>';
+  }
+  // curves
+  const colors = { '3rd': '#9aa0a6', '15th': '#80868b', '50th': '#2f9e44', '85th': '#80868b', '97th': '#9aa0a6' };
+  series.forEach(function (ser) {
+    const d = 'M' + ser.pts.map(function (p) { return f1(X(p[0])) + ',' + f1(Y(p[1])); }).join('L');
+    const w = ser.label === '50th' ? 2.6 : 1.1;
+    s += '<path d="' + d + '" fill="none" stroke="' + colors[ser.label] + '" stroke-width="' + w + '"/>';
+  });
+  // child points
+  const pts = kidMeasurements(kid.id).map(function (m) {
+    const v = INDICATORS[indKey].get(m);
+    if (v == null) return null;
+    const day = ageDays(kid.birth, m.date);
+    if (day < 0 || day > WHO_MAX_DAYS) return null;
+    return { m: m, x: X(day / DAYS_PER_MONTH), y: Y(toDisp(v)) };
+  }).filter(Boolean);
+  pts.forEach(function (p) {
+    const sel = p.m.id === selectedId;
+    s += '<circle cx="' + f1(p.x) + '" cy="' + f1(p.y) + '" r="' + (sel ? 7 : 5) + '" fill="#1a73e8"'
+      + ' data-action="select-point" data-id="' + p.m.id + '" style="cursor:pointer">'
+      + '<title>' + esc(fmtDate(p.m.date)) + '</title></circle>';
+    if (sel) s += '<line x1="' + f1(p.x) + '" y1="' + PT + '" x2="' + f1(p.x) + '" y2="' + (H - PB) + '" stroke="#1a73e8" stroke-dasharray="4,4" opacity="0.5"/>';
+  });
+  s += '</svg>';
+  return s;
+}
+
+/* ---------------- views ---------------- */
+function topbar(title, back) {
+  return '<div class="topbar">' +
+    (back ? '<a class="back" href="#" data-action="nav-kids" aria-label="Back">‹</a>' : '') +
+    '<h1>' + esc(title) + '</h1>' +
+    (view.name === 'kids'
+      ? '<button class="iconbtn" data-action="nav-settings" aria-label="Settings">⚙️</button>'
+        + '<button class="iconbtn" data-action="open-kid-modal" aria-label="Add child" style="background:var(--green);color:#fff">＋</button>'
+      : '') +
+    '</div>';
+}
+
+function kidsView() {
+  let h = topbar('Sprout', false);
+  if (!DB.kids.length) {
+    h += '<div class="empty"><div class="big">🌱</div><h2>Track their growth</h2>' +
+      '<p>Log weight, length, and head circumference, and watch them grow against WHO reference curves with percentiles.</p>' +
+      '<button class="btn primary" data-action="open-kid-modal">Add your first child</button></div>';
+  } else {
+    h += DB.kids.map(function (k) {
+      const n = kidMeasurements(k.id).length;
+      return '<a class="kidrow" href="#" data-action="nav-kid" data-id="' + k.id + '">' +
+        '<span class="avatar">' + (k.sex === 'boy' ? '👦' : '👧') + '</span>' +
+        '<span><span class="name">' + esc(k.name) + '</span>' +
+        '<div class="sub">' + esc(ageString(k.birth)) + ' old · ' + n + ' measurement' + (n === 1 ? '' : 's') + '</div></span>' +
+        '<span class="chev">›</span></a>';
+    }).join('');
+  }
+  h += '<p class="caption footnote">Data is stored only on this device. Back it up from Settings → Export.</p>';
+  return h;
+}
+
+function statCards(kid, tab) {
+  return '<div class="stats">' + IND_KEYS.map(function (key) {
+    const ind = INDICATORS[key];
+    const m = latestFor(kid.id, key);
+    let inner = '<div class="t">' + ind.title + '</div>';
+    if (m) {
+      const v = ind.get(m);
+      inner += '<div class="v">' + esc(ind.fmt(v)) + '</div>';
+      const p = percentileOf(kid, m, key);
+      inner += p == null
+        ? '<div class="p muted">past 5y</div>'
+        : '<div class="p">' + ordinal(p) + ' pct</div>';
+    } else {
+      inner += '<div class="v muted">—</div>';
+    }
+    return '<button class="stat' + (tab === key ? ' active' : '') + '" data-action="set-tab" data-ind="' + key + '">' + inner + '</button>';
+  }).join('') + '</div>';
+}
+
+function pointInfo(kid, indKey, selectedId) {
+  const ind = INDICATORS[indKey];
+  let m = selectedId ? DB.measurements.find(function (x) { return x.id === selectedId; }) : null;
+  if (!m || INDICATORS[indKey].get(m) == null) m = latestFor(kid.id, indKey);
+  if (!m) return '<p class="small muted">No ' + ind.title.toLowerCase() + ' measurements yet — tap ＋ below to add one.</p>';
+  const v = ind.get(m);
+  const p = percentileOf(kid, m, indKey);
+  return '<div class="ptinfo"><div><div class="d">' + esc(fmtDate(m.date)) + '</div>' +
+    '<div class="a">' + esc(ageString(kid.birth, m.date)) + ' old</div></div>' +
+    '<div><div class="v">' + esc(ind.fmt(v)) + '</div>' +
+    '<div class="p">' + (p == null ? 'outside WHO range' : ordinal(p) + ' percentile') + '</div></div></div>';
+}
+
+function kidView(kidId) {
+  const kid = getKid(kidId);
+  if (!kid) return kidsView();
+  const tab = view.tab || 'weight';
+  const ind = INDICATORS[tab];
+  const ms = kidMeasurements(kidId).slice().reverse();
+
+  let h = topbar(kid.name, true);
+  h += '<div class="card"><div style="display:flex;align-items:center;gap:10px">' +
+    '<div style="flex:1"><h3 style="font-size:17px">' + esc(ageString(kid.birth)) + ' old</h3>' +
+    '<div class="small muted">Born ' + esc(fmtDate(kid.birth)) + ' · ' + (kid.sex === 'boy' ? 'Boy' : 'Girl') + '</div></div>' +
+    '<button class="btn ghost" data-action="open-kid-modal" data-id="' + kid.id + '">Edit</button>' +
+    '</div></div>';
+
+  h += statCards(kid, tab);
+
+  h += '<div class="seg">' + IND_KEYS.map(function (key) {
+    return '<button class="' + (tab === key ? 'active' : '') + '" data-action="set-tab" data-ind="' + key + '">' + INDICATORS[key].title + '</button>';
+  }).join('') + '</div>';
+  h += '<p class="caption">' + esc(ind.hint) + '</p>';
+
+  h += '<div class="chart-wrap">' + chartSVG(kid, tab, view.selectedId) + '</div>';
+  h += '<div class="legend"><span><span class="dot" style="background:#2f9e44"></span>50th</span>' +
+    '<span><span class="dot" style="background:#9aa0a6"></span>3rd / 97th</span>' +
+    '<span><span class="dot" style="background:#1a73e8"></span>' + esc(kid.name) + '</span></div>';
+  h += pointInfo(kid, tab, view.selectedId);
+
+  h += '<div class="sect-head"><h2>Measurements</h2>' +
+    '<button class="iconbtn" data-action="open-msr-modal" data-kid="' + kid.id + '" aria-label="Add measurement" style="background:var(--green);color:#fff">＋</button></div>';
+  if (!ms.length) {
+    h += '<p class="small muted">No measurements yet.</p>';
+  } else {
+    h += ms.map(function (m) {
+      const vals = IND_KEYS.map(function (key) {
+        const v = INDICATORS[key].get(m);
+        if (v == null) return '';
+        const p = percentileOf(kid, m, key);
+        return '<div>' + esc(INDICATORS[key].fmt(v)) +
+          (p == null ? '' : ' <span class="pct">' + ordinal(p) + '</span>') + '</div>';
+      }).join('');
+      return '<div class="mrow" data-action="open-msr-modal" data-kid="' + kid.id + '" data-id="' + m.id + '">' +
+        '<div><div class="date">' + esc(fmtDate(m.date)) + '</div>' +
+        '<div class="age">' + esc(ageString(kid.birth, m.date)) + ' old</div></div>' +
+        '<div class="vals">' + vals + '</div></div>';
+    }).join('');
+  }
+  h += '<p class="caption footnote">Reference: WHO Child Growth Standards (2006). For information only — not medical advice.</p>';
+  return h;
+}
+
+function settingsView() {
+  const u = units();
+  let h = topbar('Settings', true);
+  h += '<div class="card"><h3>Units</h3><div class="seg" style="margin-top:8px">' +
+    '<button class="' + (u === 'metric' ? 'active' : '') + '" data-action="set-units" data-v="metric">Metric (kg, cm)</button>' +
+    '<button class="' + (u === 'imperial' ? 'active' : '') + '" data-action="set-units" data-v="imperial">Imperial (lb, in)</button>' +
+    '</div></div>';
+  h += '<div class="card"><h3>Backup</h3>' +
+    '<p class="small muted">Your data lives only in this browser. Export a backup before clearing site data or switching devices.</p>' +
+    '<div class="btnrow"><button class="btn ghost" data-action="export">Export JSON</button>' +
+    '<label class="btn ghost" style="text-align:center;cursor:pointer">Import JSON<input type="file" accept="application/json" data-change="import" style="display:none"></label></div></div>';
+  h += '<div class="card"><h3>Add to Home Screen</h3>' +
+    '<p class="small muted">On iPhone: open this page in Safari → Share → <b>Add to Home Screen</b>. It then opens full-screen like an app and works offline.</p></div>';
+  h += '<div class="card"><h3>Reference data</h3>' +
+    '<p class="disclaimer">Growth curves and percentiles come from the WHO Child Growth Standards (2006) — weight-for-age, length/height-for-age, and head-circumference-for-age for boys and girls, birth to 5 years, computed with the LMS method.</p></div>';
+  h += '<div class="card"><h3>Please note</h3>' +
+    '<p class="disclaimer">Sprout is a tracking tool, not medical advice. If a measurement looks off the expected curve or you\'re worried about your child\'s growth, talk to your pediatrician.</p></div>';
+  return h;
+}
+
+/* ---------------- modals ---------------- */
+function kidModal(kidId) {
+  const k = kidId ? getKid(kidId) : null;
+  return '<div class="modal-back" data-action="backdrop"><div class="modal" role="dialog">' +
+    '<div class="grabber"></div><h2>' + (k ? 'Edit child' : 'Add child') + '</h2>' +
+    '<form data-form="kid"><input type="hidden" name="id" value="' + (k ? k.id : '') + '">' +
+    '<div class="field"><label>Name</label><input name="name" required maxlength="40" value="' + esc(k ? k.name : '') + '" placeholder="e.g. Maya"></div>' +
+    '<div class="field"><label>Sex <span class="hint">— picks the right WHO reference curves</span></label>' +
+    '<select name="sex"><option value="boy"' + (!k || k.sex === 'boy' ? ' selected' : '') + '>Boy</option>' +
+    '<option value="girl"' + (k && k.sex === 'girl' ? ' selected' : '') + '>Girl</option></select></div>' +
+    '<div class="field"><label>Birth date</label><input type="date" name="birth" required max="' + todayStr() + '" value="' + esc(k ? k.birth : '') + '"></div>' +
+    '<div class="ferr" data-err></div>' +
+    '<div class="btnrow"><button type="button" class="btn ghost" data-action="close-modal">Cancel</button>' +
+    '<button type="submit" class="btn primary">' + (k ? 'Save' : 'Add') + '</button></div>' +
+    (k ? '<button type="button" class="btn danger block" data-action="delete-kid" data-id="' + k.id + '">Delete ' + esc(k.name) + '</button>' : '') +
+    '</form></div></div>';
+}
+
+function trimNum(v) {
+  const s = Number(v).toFixed(2).replace(/0+$/, '').replace(/\.$/, '');
+  return s;
+}
+function msrModal(kidId, msrId) {
+  const kid = getKid(kidId);
+  const m = msrId ? DB.measurements.find(function (x) { return x.id === msrId; }) : null;
+  const dispW = m && m.weightKg != null ? trimNum(dispWeight(m.weightKg)) : '';
+  const dispL = m && m.lengthCm != null ? trimNum(dispLength(m.lengthCm)) : '';
+  const dispH = m && m.headCm != null ? trimNum(dispLength(m.headCm)) : '';
+  const dateVal = m ? m.date : todayStr();
+  const ageD = ageDays(kid.birth, dateVal);
+  const lenHint = ageD < 730 ? 'Lying down' : 'Standing';
+
+  function fld(name, label, val, unit, hint, ph) {
+    const options = name === 'weight' ? ['lb', 'kg'] : ['in', 'cm'];
+    return '<div class="field"><label for="msr-' + name + '">' + label + ' <span class="hint">— ' + hint + '</span></label>' +
+      '<div class="input-row"><input id="msr-' + name + '" name="' + name + '" inputmode="decimal" placeholder="' + ph + '" value="' + esc(val) + '">' +
+      '<input type="hidden" name="' + name + 'Unit" value="' + unit + '">' +
+      '<div class="seg unit-toggle" role="group" aria-label="' + label + ' unit">' + options.map(function (option) {
+        return '<button type="button" class="' + (unit === option ? 'active' : '') + '" aria-pressed="' + (unit === option) +
+          '" data-action="set-input-unit" data-field="' + name + '" data-v="' + option + '">' + option + '</button>';
+      }).join('') + '</div></div></div>';
+  }
+  return '<div class="modal-back" data-action="backdrop"><div class="modal" role="dialog">' +
+    '<div class="grabber"></div><h2>' + (m ? 'Edit measurement' : 'Add measurement') + '</h2>' +
+    '<form data-form="msr"><input type="hidden" name="id" value="' + (m ? m.id : '') + '">' +
+    '<input type="hidden" name="kidId" value="' + kid.id + '">' +
+    '<div class="field"><label>Date</label><input type="date" name="date" required min="' + esc(kid.birth) + '" max="' + todayStr() + '" value="' + esc(dateVal) + '" data-change="msr-date">' +
+    '<div class="small muted" style="margin-top:4px" data-age>Age on this date: ' + esc(ageString(kid.birth, dateVal)) + '</div></div>' +
+    fld('weight', 'Weight', dispW, weightUnit(), 'optional', INDICATORS.weight.ph) +
+    fld('length', 'Length', dispL, lengthUnit(), lenHint + ', optional', INDICATORS.length.ph) +
+    fld('head', 'Head circumference', dispH, lengthUnit(), 'widest part, optional', INDICATORS.head.ph) +
+    '<p class="caption">Fill in whichever you measured — at least one is required.</p>' +
+    '<div class="ferr" data-err></div>' +
+    '<div class="btnrow"><button type="button" class="btn ghost" data-action="close-modal">Cancel</button>' +
+    '<button type="submit" class="btn primary">Save</button></div>' +
+    (m ? '<button type="button" class="btn danger block" data-action="delete-msr" data-id="' + m.id + '" data-kid="' + kid.id + '">Delete this measurement</button>' : '') +
+    '</form></div></div>';
+}
+
+/* ---------------- render ---------------- */
+function render() {
+  const app = document.getElementById('app');
+  if (view.name === 'kid') app.innerHTML = kidView(view.kidId);
+  else if (view.name === 'settings') app.innerHTML = settingsView();
+  else app.innerHTML = kidsView();
+  const mr = document.getElementById('modal-root');
+  if (!modal) { mr.innerHTML = ''; return; }
+  mr.innerHTML = modal.type === 'kid' ? kidModal(modal.kidId) : msrModal(modal.kidId, modal.msrId);
+  const first = mr.querySelector('input[name="name"], input[name="date"]');
+  if (first && !modal.kidId && !modal.msrId) setTimeout(function () { first.focus(); }, 60);
+}
+
+/* ---------------- form handling ---------------- */
+function formError(form, msg) {
+  const el = form.querySelector('[data-err]');
+  if (el) el.textContent = msg;
+}
+function handleKidForm(form) {
+  const fd = new FormData(form);
+  const id = fd.get('id');
+  const name = String(fd.get('name') || '').trim();
+  const sex = fd.get('sex') === 'girl' ? 'girl' : 'boy';
+  const birth = String(fd.get('birth') || '');
+  if (!name) return formError(form, 'Give them a name first.');
+  if (!birth) return formError(form, 'Pick a birth date.');
+  if (id) {
+    const k = getKid(id);
+    if (k) { k.name = name; k.sex = sex; k.birth = birth; }
+  } else {
+    const k = { id: uid(), name: name, sex: sex, birth: birth };
+    DB.kids.push(k);
+    view = { name: 'kid', kidId: k.id, tab: 'weight' };
+  }
+  modal = null; saveDB(); render();
+}
+function handleMsrForm(form) {
+  const fd = new FormData(form);
+  const id = fd.get('id'), kidId = fd.get('kidId');
+  const kid = getKid(kidId);
+  if (!kid) return;
+  const date = String(fd.get('date') || '');
+  const w = parseNum(fd.get('weight')), l = parseNum(fd.get('length')), h = parseNum(fd.get('head'));
+  if (!date) return formError(form, 'Pick a date.');
+  const anyTyped = String(fd.get('weight') || '').trim() || String(fd.get('length') || '').trim() || String(fd.get('head') || '').trim();
+  if (!anyTyped) return formError(form, 'Enter at least one measurement.');
+  if ((w == null && String(fd.get('weight') || '').trim()) || w !== w ||
+      (l == null && String(fd.get('length') || '').trim()) || l !== l ||
+      (h == null && String(fd.get('head') || '').trim()) || h !== h)
+    return formError(form, "Couldn't read those numbers — use digits like 8.4.");
+  const rec = {
+    weightKg: w == null ? null : toKg(w, fd.get('weightUnit')),
+    lengthCm: l == null ? null : toCm(l, fd.get('lengthUnit')),
+    headCm: h == null ? null : toCm(h, fd.get('headUnit'))
+  };
+  if (id) {
+    const m = DB.measurements.find(function (x) { return x.id === id; });
+    if (m) { m.date = date; m.weightKg = rec.weightKg; m.lengthCm = rec.lengthCm; m.headCm = rec.headCm; }
+  } else {
+    DB.measurements.push({ id: uid(), kidId: kidId, date: date,
+      weightKg: rec.weightKg, lengthCm: rec.lengthCm, headCm: rec.headCm });
+  }
+  modal = null; saveDB(); render();
+}
+
+/* ---------------- actions ---------------- */
+const Actions = {
+  'nav-kids': function () { view = { name: 'kids' }; render(); },
+  'nav-kid': function (d) { view = { name: 'kid', kidId: d.id, tab: 'weight' }; render(); window.scrollTo(0, 0); },
+  'nav-settings': function () { view = { name: 'settings' }; render(); window.scrollTo(0, 0); },
+  'open-kid-modal': function (d) { modal = { type: 'kid', kidId: d.id || null }; render(); },
+  'open-msr-modal': function (d) { modal = { type: 'msr', kidId: d.kid, msrId: d.id || null }; render(); },
+  'close-modal': function () { modal = null; render(); },
+  'backdrop': function (d, el, e) { if (e.target === el) { modal = null; render(); } },
+  'set-tab': function (d) { view.tab = d.ind; view.selectedId = null; render(); },
+  'select-point': function (d) {
+    view.selectedId = view.selectedId === d.id ? null : d.id;
+    render();
+  },
+  'set-units': function (d) { DB.units = d.v === 'metric' ? 'metric' : 'imperial'; saveDB(); render(); },
+  'set-input-unit': function (d, el) {
+    const form = el.closest('form');
+    const input = form.elements[d.field];
+    const unit = form.elements[d.field + 'Unit'];
+    if (unit.value === d.v) return;
+    const value = parseNum(input.value);
+    if (value != null && isFinite(value)) {
+      const metric = d.field === 'weight' ? toKg(value, unit.value) : toCm(value, unit.value);
+      const converted = d.v === 'lb' ? metric * 2.20462 : d.v === 'in' ? metric / 2.54 : metric;
+      input.value = String(Number(converted.toPrecision(12)));
+    }
+    unit.value = d.v;
+    form.querySelectorAll('[data-action="set-input-unit"][data-field="' + d.field + '"]').forEach(function (button) {
+      const active = button.dataset.v === d.v;
+      button.classList.toggle('active', active);
+      button.setAttribute('aria-pressed', String(active));
+    });
+  },
+  'delete-kid': function (d) {
+    const k = getKid(d.id);
+    if (!k) return;
+    if (!confirm('Delete ' + k.name + ' and all their measurements? This can\'t be undone.')) return;
+    DB.kids = DB.kids.filter(function (x) { return x.id !== d.id; });
+    DB.measurements = DB.measurements.filter(function (x) { return x.kidId !== d.id; });
+    modal = null; view = { name: 'kids' }; saveDB(); render();
+  },
+  'delete-msr': function (d) {
+    if (!confirm('Delete this measurement?')) return;
+    DB.measurements = DB.measurements.filter(function (x) { return x.id !== d.id; });
+    modal = null; saveDB(); render();
+  },
+  'export': function () {
+    const blob = new Blob([JSON.stringify(DB, null, 2)], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'sprout-backup-' + todayStr() + '.json';
+    document.body.appendChild(a); a.click();
+    setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 500);
+  }
+};
+
+function handleImport(input) {
+  const f = input.files && input.files[0];
+  if (!f) return;
+  const r = new FileReader();
+  r.onload = function () {
+    try {
+      const d = JSON.parse(r.result);
+      if (!d || !Array.isArray(d.kids) || !Array.isArray(d.measurements)) throw new Error('bad file');
+      DB = d;
+      if (DB.units !== 'metric' && DB.units !== 'imperial') DB.units = 'imperial';
+      saveDB(); view = { name: 'kids' }; render();
+      alert('Backup imported.');
+    } catch (e) { alert("Couldn't read that backup file."); }
+    input.value = '';
+  };
+  r.readAsText(f);
+}
+
+/* ---------------- boot ---------------- */
+if (typeof document !== 'undefined') {
+  DB = loadDB();
+  document.addEventListener('click', function (e) {
+    const el = e.target.closest('[data-action]');
+    if (!el) return;
+    const fn = Actions[el.dataset.action];
+    if (fn) {
+      if (el.tagName === 'A') e.preventDefault();
+      fn(el.dataset, el, e);
+    }
+  });
+  document.addEventListener('submit', function (e) {
+    const form = e.target.closest('[data-form]');
+    if (!form) return;
+    e.preventDefault();
+    if (form.dataset.form === 'kid') handleKidForm(form);
+    else if (form.dataset.form === 'msr') handleMsrForm(form);
+  });
+  document.addEventListener('change', function (e) {
+    const el = e.target.closest('[data-change]');
+    if (!el) return;
+    if (el.dataset.change === 'import') handleImport(el);
+    else if (el.dataset.change === 'msr-date') {
+      const kidId = (document.querySelector('input[name="kidId"]') || {}).value;
+      const kid = kidId && getKid(kidId);
+      const ageEl = document.querySelector('[data-age]');
+      if (kid && ageEl && el.value) {
+        const d = ageDays(kid.birth, el.value);
+        ageEl.textContent = 'Age on this date: ' + ageString(kid.birth, el.value);
+      }
+    }
+  });
+  document.addEventListener('DOMContentLoaded', function () { render(); });
+  if ('serviceWorker' in navigator && /^https?:$/.test(location.protocol)) {
+    window.addEventListener('load', function () {
+      navigator.serviceWorker.register('sw.js').catch(function () {});
+    });
+  }
+}
