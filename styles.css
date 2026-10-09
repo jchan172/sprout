@@ -131,3 +131,6 @@ body {
 
 .disclaimer { font-size: 12px; color: var(--muted); line-height: 1.55; }
 .footnote { margin-top: 18px; }
+.codebox { font-family: ui-monospace, Menlo, monospace; font-size: 15px; background: #fff;
+  border: 1px dashed var(--line); border-radius: 10px; padding: 12px; text-align: center;
+  letter-spacing: 1px; margin: 10px 0; user-select: all; }

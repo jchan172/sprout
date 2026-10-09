@@ -104,7 +104,7 @@ const IND_KEYS = ['weight', 'length', 'head'];
 /* ---------------- store (localStorage) ---------------- */
 const LS_KEY = 'sprout.v1';
 let DB = null;
-function defaultDB() { return { kids: [], measurements: [], units: 'imperial' }; }
+function defaultDB() { return { kids: [], measurements: [], deleted: [], units: 'imperial' }; }
 function loadDB() {
   try {
     const raw = localStorage.getItem(LS_KEY);
@@ -112,6 +112,12 @@ function loadDB() {
     const d = JSON.parse(raw);
     if (!d || !Array.isArray(d.kids) || !Array.isArray(d.measurements)) return defaultDB();
     if (d.units !== 'metric' && d.units !== 'imperial') d.units = 'imperial';
+    if (!Array.isArray(d.deleted)) d.deleted = [];
+    // backfill updatedAt for records created before sync existed
+    const now = Date.now();
+    d.kids.forEach(function (k) { if (!k.updatedAt) k.updatedAt = now; });
+    d.measurements.forEach(function (m) { if (!m.updatedAt) m.updatedAt = now; });
+    d.deleted.forEach(function (t) { if (!t.updatedAt) t.updatedAt = now; });
     return d;
   } catch (e) { return defaultDB(); }
 }
@@ -138,6 +144,121 @@ function percentileOf(kid, msr, indKey) {
   const lms = lmsAt(indKey, kid.sex, day);
   if (!lms) return null;
   return percentileFor(v, lms[0], lms[1], lms[2]);
+}
+
+/* ---------------- sync (Cloudflare KV via Pages Functions) ----------------
+   No database: the whole dataset is a small JSON snapshot stored under a
+   random sync key in Workers KV. Devices merge record-by-record using
+   updatedAt, so concurrent edits don't clobber each other. */
+const SYNC_LS = 'sprout.sync.v1';
+let SYNC = { key: null, lastSyncedAt: 0 };
+let syncNote = ''; // transient status line for Settings
+function loadSync() {
+  try {
+    const raw = localStorage.getItem(SYNC_LS);
+    if (!raw) return { key: null, lastSyncedAt: 0 };
+    const s = JSON.parse(raw);
+    return { key: typeof s.key === 'string' ? s.key : null, lastSyncedAt: s.lastSyncedAt || 0 };
+  } catch (e) { return { key: null, lastSyncedAt: 0 }; }
+}
+function saveSync() {
+  try { localStorage.setItem(SYNC_LS, JSON.stringify(SYNC)); } catch (e) {}
+}
+function genSyncKey() {
+  let hex = '';
+  if (typeof crypto !== 'undefined' && crypto.getRandomValues) {
+    const b = new Uint8Array(12);
+    crypto.getRandomValues(b);
+    hex = Array.from(b, function (x) { return x.toString(16).padStart(2, '0'); }).join('');
+  } else {
+    for (let i = 0; i < 24; i++) hex += Math.floor(Math.random() * 16).toString(16);
+  }
+  return [0, 4, 8, 12, 16, 20].map(function (i) { return hex.slice(i, i + 4); }).join('-');
+}
+function snapshot() {
+  return { v: 1, updatedAt: Date.now(), kids: DB.kids, measurements: DB.measurements, deleted: DB.deleted };
+}
+function applySnapshot(s) {
+  DB.kids = Array.isArray(s.kids) ? s.kids : [];
+  DB.measurements = Array.isArray(s.measurements) ? s.measurements : [];
+  DB.deleted = Array.isArray(s.deleted) ? s.deleted : [];
+  saveDB(); // units stay local-only; never synced
+}
+function mergeSnapshots(a, b) {
+  const byId = new Map(); // id -> {rec, tomb}
+  function add(rec, isTomb) {
+    let e = byId.get(rec.id);
+    if (!e) { e = { rec: null, tomb: null }; byId.set(rec.id, e); }
+    const cur = isTomb ? e.tomb : e.rec;
+    if (!cur || (rec.updatedAt || 0) > (cur.updatedAt || 0)) {
+      if (isTomb) e.tomb = rec; else e.rec = rec;
+    }
+  }
+  (a.kids || []).forEach(function (r) { add(r, false); });
+  (b.kids || []).forEach(function (r) { add(r, false); });
+  (a.measurements || []).forEach(function (r) { add(r, false); });
+  (b.measurements || []).forEach(function (r) { add(r, false); });
+  (a.deleted || []).forEach(function (t) { add(t, true); });
+  (b.deleted || []).forEach(function (t) { add(t, true); });
+  const kids = [], measurements = [], deleted = [];
+  byId.forEach(function (e) {
+    const t = e.tomb, r = e.rec;
+    if (t && (!r || (t.updatedAt || 0) >= (r.updatedAt || 0))) { deleted.push(t); return; }
+    if (r) {
+      if (r.kidId !== undefined) measurements.push(r); else kids.push(r);
+    } else if (t) { deleted.push(t); }
+  });
+  deleted.sort(function (x, y) { return (y.updatedAt || 0) - (x.updatedAt || 0); });
+  return { v: 1, updatedAt: Date.now(), kids: kids, measurements: measurements, deleted: deleted.slice(0, 500) };
+}
+
+let syncing = false;
+let syncTimer = 0;
+function scheduleSync() {
+  if (!SYNC.key || typeof fetch === 'undefined') return;
+  clearTimeout(syncTimer);
+  syncTimer = setTimeout(function () { syncNow(); }, 2500);
+}
+async function syncNow() {
+  if (!SYNC.key || syncing || typeof fetch === 'undefined') return false;
+  syncing = true;
+  try {
+    const url = '/api/sync/' + encodeURIComponent(SYNC.key);
+    const local = snapshot();
+    let remote = null;
+    const r = await fetch(url, { cache: 'no-store' });
+    if (r.status === 200) remote = await r.json();
+    else if (r.status !== 404) throw new Error('get ' + r.status);
+    const merged = remote ? mergeSnapshots(local, remote) : local;
+    const put = await fetch(url, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(merged)
+    });
+    if (!put.ok) throw new Error('put ' + put.status);
+    applySnapshot(merged);
+    SYNC.lastSyncedAt = Date.now(); saveSync();
+    syncNote = '';
+    // don't clobber a form the user is typing in; it re-renders on close
+    if (!modal) render();
+    return true;
+  } catch (e) {
+    syncNote = 'Sync failed — check your connection and try again.';
+    if (view.name === 'settings' && !modal) render();
+    return false;
+  } finally {
+    syncing = false;
+  }
+}
+function syncStatusText() {
+  if (syncNote) return syncNote;
+  if (!SYNC.lastSyncedAt) return 'Enabled — not synced yet.';
+  const s = Math.round((Date.now() - SYNC.lastSyncedAt) / 1000);
+  if (s < 10) return 'Synced just now.';
+  if (s < 60) return 'Synced ' + s + 's ago.';
+  const m = Math.round(s / 60);
+  if (m < 60) return 'Synced ' + m + 'm ago.';
+  return 'Synced ' + new Date(SYNC.lastSyncedAt).toLocaleString() + '.';
 }
 
 /* ---------------- view state ---------------- */
@@ -331,6 +452,30 @@ function kidView(kidId) {
   return h;
 }
 
+function syncSection() {
+  if (!SYNC.key) {
+    return '<div class="card"><h3>Sync between devices</h3>' +
+      '<p class="small muted">Keep the same data on your phone, tablet, etc. — stored as a small file in Cloudflare KV, no database. Enable on <b>one</b> device, then join with the code on the others.</p>' +
+      '<button class="btn primary block" data-action="sync-enable">Enable sync on this device</button>' +
+      '<div class="field"><label>Or join with a code</label><div class="input-row">' +
+      '<input data-sync-code placeholder="xxxx-xxxx-xxxx-xxxx" autocapitalize="off" autocorrect="off" spellcheck="false">' +
+      '<button class="btn ghost" data-action="sync-join">Join</button></div></div>' +
+      '<div class="ferr" data-sync-err></div></div>';
+  }
+  return '<div class="card"><h3>Sync between devices</h3>' +
+    '<p class="small muted">Enter this code on your other device under Settings → Sync → Join with a code. Anyone with the code can read and write this data.</p>' +
+    '<div class="codebox">' + esc(SYNC.key) + '</div>' +
+    '<div class="btnrow"><button class="btn ghost" data-action="sync-copy">Copy code</button>' +
+    '<button class="btn ghost" data-action="sync-now">Sync now</button></div>' +
+    '<p class="small muted">' + esc(syncStatusText()) + '</p>' +
+    '<div class="ferr" data-sync-err></div>' +
+    '<button class="btn danger block" data-action="sync-disable">Disable sync</button></div>';
+}
+function syncErr(msg) {
+  const el = document.querySelector('[data-sync-err]');
+  if (el) el.textContent = msg;
+}
+
 function settingsView() {
   const u = units();
   let h = topbar('Settings', true);
@@ -338,6 +483,7 @@ function settingsView() {
     '<button class="' + (u === 'metric' ? 'active' : '') + '" data-action="set-units" data-v="metric">Metric (kg, cm)</button>' +
     '<button class="' + (u === 'imperial' ? 'active' : '') + '" data-action="set-units" data-v="imperial">Imperial (lb, in)</button>' +
     '</div></div>';
+  h += syncSection();
   h += '<div class="card"><h3>Backup</h3>' +
     '<p class="small muted">Your data lives only in this browser. Export a backup before clearing site data or switching devices.</p>' +
     '<div class="btnrow"><button class="btn ghost" data-action="export">Export JSON</button>' +
@@ -438,13 +584,13 @@ function handleKidForm(form) {
   if (!birth) return formError(form, 'Pick a birth date.');
   if (id) {
     const k = getKid(id);
-    if (k) { k.name = name; k.sex = sex; k.birth = birth; }
+    if (k) { k.name = name; k.sex = sex; k.birth = birth; k.updatedAt = Date.now(); }
   } else {
-    const k = { id: uid(), name: name, sex: sex, birth: birth };
+    const k = { id: uid(), name: name, sex: sex, birth: birth, updatedAt: Date.now() };
     DB.kids.push(k);
     view = { name: 'kid', kidId: k.id, tab: 'weight' };
   }
-  modal = null; saveDB(); render();
+  modal = null; saveDB(); scheduleSync(); render();
 }
 function handleMsrForm(form) {
   const fd = new FormData(form);
@@ -467,12 +613,12 @@ function handleMsrForm(form) {
   };
   if (id) {
     const m = DB.measurements.find(function (x) { return x.id === id; });
-    if (m) { m.date = date; m.weightKg = rec.weightKg; m.lengthCm = rec.lengthCm; m.headCm = rec.headCm; }
+    if (m) { m.date = date; m.weightKg = rec.weightKg; m.lengthCm = rec.lengthCm; m.headCm = rec.headCm; m.updatedAt = Date.now(); }
   } else {
     DB.measurements.push({ id: uid(), kidId: kidId, date: date,
-      weightKg: rec.weightKg, lengthCm: rec.lengthCm, headCm: rec.headCm });
+      weightKg: rec.weightKg, lengthCm: rec.lengthCm, headCm: rec.headCm, updatedAt: Date.now() });
   }
-  modal = null; saveDB(); render();
+  modal = null; saveDB(); scheduleSync(); render();
 }
 
 /* ---------------- actions ---------------- */
@@ -512,14 +658,20 @@ const Actions = {
     const k = getKid(d.id);
     if (!k) return;
     if (!confirm('Delete ' + k.name + ' and all their measurements? This can\'t be undone.')) return;
+    const now = Date.now();
+    DB.deleted.push({ id: k.id, updatedAt: now });
+    DB.measurements.forEach(function (m) {
+      if (m.kidId === d.id) DB.deleted.push({ id: m.id, updatedAt: now });
+    });
     DB.kids = DB.kids.filter(function (x) { return x.id !== d.id; });
     DB.measurements = DB.measurements.filter(function (x) { return x.kidId !== d.id; });
-    modal = null; view = { name: 'kids' }; saveDB(); render();
+    modal = null; view = { name: 'kids' }; saveDB(); scheduleSync(); render();
   },
   'delete-msr': function (d) {
     if (!confirm('Delete this measurement?')) return;
+    DB.deleted.push({ id: d.id, updatedAt: Date.now() });
     DB.measurements = DB.measurements.filter(function (x) { return x.id !== d.id; });
-    modal = null; saveDB(); render();
+    modal = null; saveDB(); scheduleSync(); render();
   },
   'export': function () {
     const blob = new Blob([JSON.stringify(DB, null, 2)], { type: 'application/json' });
@@ -528,6 +680,36 @@ const Actions = {
     a.download = 'sprout-backup-' + todayStr() + '.json';
     document.body.appendChild(a); a.click();
     setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 500);
+  },
+  'sync-enable': function () {
+    SYNC.key = genSyncKey(); SYNC.lastSyncedAt = 0; saveSync();
+    render();
+    syncNow().then(function () { render(); });
+  },
+  'sync-join': function () {
+    const input = document.querySelector('[data-sync-code]');
+    const code = ((input && input.value) || '').trim().toLowerCase();
+    if (!/^[a-z0-9-]{8,64}$/.test(code)) { syncErr('Enter the code from your other device.'); return; }
+    SYNC.key = code; SYNC.lastSyncedAt = 0; saveSync();
+    render();
+    syncNow().then(function (ok) {
+      if (!ok) {
+        SYNC.key = null; saveSync(); render();
+        syncErr('Could not find that code. Check it and try again.');
+      } else { render(); }
+    });
+  },
+  'sync-copy': function () {
+    const done = function () { syncNote = 'Code copied.'; render(); };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(SYNC.key).then(done, function () { syncErr('Copy failed — long-press the code to copy it.'); });
+    } else { syncErr('Long-press the code to copy it.'); }
+  },
+  'sync-now': function () { syncNow().then(function () { render(); }); },
+  'sync-disable': function () {
+    if (!confirm('Disable sync on this device? Your local data stays.')) return;
+    SYNC.key = null; SYNC.lastSyncedAt = 0; syncNote = ''; saveSync();
+    render();
   }
 };
 
@@ -541,7 +723,11 @@ function handleImport(input) {
       if (!d || !Array.isArray(d.kids) || !Array.isArray(d.measurements)) throw new Error('bad file');
       DB = d;
       if (DB.units !== 'metric' && DB.units !== 'imperial') DB.units = 'imperial';
-      saveDB(); view = { name: 'kids' }; render();
+      if (!Array.isArray(DB.deleted)) DB.deleted = [];
+      const now = Date.now();
+      DB.kids.forEach(function (k) { if (!k.updatedAt) k.updatedAt = now; });
+      DB.measurements.forEach(function (m) { if (!m.updatedAt) m.updatedAt = now; });
+      saveDB(); scheduleSync(); view = { name: 'kids' }; render();
       alert('Backup imported.');
     } catch (e) { alert("Couldn't read that backup file."); }
     input.value = '';
@@ -552,6 +738,7 @@ function handleImport(input) {
 /* ---------------- boot ---------------- */
 if (typeof document !== 'undefined') {
   DB = loadDB();
+  SYNC = loadSync();
   document.addEventListener('click', function (e) {
     const el = e.target.closest('[data-action]');
     if (!el) return;
@@ -582,7 +769,13 @@ if (typeof document !== 'undefined') {
       }
     }
   });
-  document.addEventListener('DOMContentLoaded', function () { render(); });
+  document.addEventListener('DOMContentLoaded', function () {
+    render();
+    if (SYNC.key) syncNow(); // catch up with other devices on launch
+  });
+  document.addEventListener('visibilitychange', function () {
+    if (!document.hidden && SYNC.key && Date.now() - SYNC.lastSyncedAt > 60000) syncNow();
+  });
   if ('serviceWorker' in navigator && /^https?:$/.test(location.protocol)) {
     window.addEventListener('load', function () {
       navigator.serviceWorker.register('sw.js').catch(function () {});
