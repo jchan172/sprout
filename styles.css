@@ -39,7 +39,9 @@ body {
 .kidrow { display: flex; align-items: center; gap: 12px; background: var(--card);
   border-radius: var(--radius); padding: 14px 16px; margin: 10px 0; text-decoration: none; color: inherit; }
 .kidrow:active { background: #e8eaed; }
-.kidrow .avatar { font-size: 30px; }
+.kidrow .avatar { width: 48px; height: 48px; border-radius: 50%; overflow: hidden; flex: none;
+  display: flex; align-items: center; justify-content: center; font-size: 28px; background: #eef1f4; }
+.kidrow .avatar img { width: 100%; height: 100%; object-fit: cover; display: block; }
 .kidrow .name { font-size: 17px; font-weight: 650; }
 .kidrow .sub { font-size: 13px; color: var(--muted); margin-top: 2px; }
 .kidrow .chev { margin-left: auto; color: var(--muted); font-size: 20px; }
@@ -107,6 +109,10 @@ body {
 .unit-toggle button { min-height: 44px; }
 .unit-toggle button:focus-visible { outline: 2px solid var(--blue); outline-offset: 1px; }
 .ferr { color: var(--danger); font-size: 13px; margin: 8px 0; }
+.photorow { display: flex; align-items: center; gap: 12px; margin-top: 6px; }
+.photo-preview { width: 64px; height: 64px; border-radius: 50%; overflow: hidden; flex: none;
+  display: flex; align-items: center; justify-content: center; font-size: 30px; background: #eef1f4; }
+.photo-preview img { width: 100%; height: 100%; object-fit: cover; display: block; }
 
 /* modal */
 .modal-back { position: fixed; inset: 0; background: rgba(0,0,0,.35); z-index: 50;

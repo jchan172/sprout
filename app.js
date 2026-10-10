@@ -245,6 +245,7 @@ async function syncNow() {
     });
     if (!put.ok) throw new Error('put ' + put.status);
     applySnapshot(merged);
+    prunePhotos(); // drop photos for kids deleted elsewhere
     SYNC.lastSyncedAt = Date.now(); saveSync();
     syncPending = false;
     syncNote = '';
@@ -269,6 +270,72 @@ function syncStatusText() {
   const m = Math.round(s / 60);
   if (m < 60) return 'Synced ' + m + 'm ago.';
   return 'Synced ' + new Date(SYNC.lastSyncedAt).toLocaleString() + '.';
+}
+
+/* ---------------- device-local kid photos ----------------
+   Profile photos stay on this device only: they live in a separate
+   localStorage key and are NEVER part of the synced snapshot or exports. */
+const PHOTOS_LS = 'sprout.photos.v1';
+let PHOTOS = {};
+let photoDraft; // undefined = unchanged, null = remove, string = new dataURL
+function loadPhotos() {
+  try {
+    const raw = localStorage.getItem(PHOTOS_LS);
+    const p = raw ? JSON.parse(raw) : {};
+    return p && typeof p === 'object' ? p : {};
+  } catch (e) { return {}; }
+}
+function savePhotos() {
+  try { localStorage.setItem(PHOTOS_LS, JSON.stringify(PHOTOS)); } catch (e) { /* quota */ }
+}
+function prunePhotos() {
+  const ids = {};
+  DB.kids.forEach(function (k) { ids[k.id] = true; });
+  let changed = false;
+  Object.keys(PHOTOS).forEach(function (id) {
+    if (!ids[id]) { delete PHOTOS[id]; changed = true; }
+  });
+  if (changed) savePhotos();
+}
+// Photo shown in the currently open kid modal (draft, existing, or none).
+function modalPhoto() {
+  if (photoDraft !== undefined) return photoDraft;
+  const id = modal && modal.kidId;
+  return (id && PHOTOS[id]) || null;
+}
+function photoPreviewHTML(photo) {
+  return '<span class="photo-preview" data-photo-preview>' +
+    (photo ? '<img src="' + photo + '" alt="">' : '👶') + '</span>';
+}
+function updatePhotoPreview() {
+  const el = document.querySelector('[data-photo-preview]');
+  if (el) el.outerHTML = photoPreviewHTML(modalPhoto());
+  const rb = document.querySelector('[data-photo-remove]');
+  if (rb) rb.style.display = modalPhoto() ? '' : 'none';
+}
+function handlePhotoInput(input) {
+  const f = input.files && input.files[0];
+  input.value = '';
+  if (!f || !/^image\//.test(f.type || '')) return;
+  const rd = new FileReader();
+  rd.onload = function () {
+    const img = new Image();
+    img.onload = function () {
+      try {
+        const MAX = 256; // small enough for localStorage, plenty for a 48px avatar
+        const scale = Math.min(1, MAX / Math.max(img.width, img.height));
+        const w = Math.max(1, Math.round(img.width * scale));
+        const h = Math.max(1, Math.round(img.height * scale));
+        const c = document.createElement('canvas');
+        c.width = w; c.height = h;
+        c.getContext('2d').drawImage(img, 0, 0, w, h);
+        photoDraft = c.toDataURL('image/jpeg', 0.82);
+        updatePhotoPreview();
+      } catch (e) { /* canvas unavailable */ }
+    };
+    img.src = rd.result;
+  };
+  rd.readAsDataURL(f);
 }
 
 /* ---------------- Nara Baby CSV import/export ----------------
@@ -509,10 +576,10 @@ function chartSVG(kid, indKey, selectedId) {
 }
 
 /* ---------------- views ---------------- */
-function topbar(title, back) {
+function topbar(title, back, titleAction) {
   return '<div class="topbar">' +
     (back ? '<a class="back" href="#" data-action="nav-kids" aria-label="Back">‹</a>' : '') +
-    '<h1>' + esc(title) + '</h1>' +
+    '<h1' + (titleAction ? ' data-action="' + titleAction + '" style="cursor:pointer"' : '') + '>' + esc(title) + '</h1>' +
     (view.name === 'kids'
       ? '<button class="iconbtn" data-action="nav-settings" aria-label="Settings">⚙️</button>'
         + '<button class="iconbtn" data-action="open-kid-modal" aria-label="Add child" style="background:var(--green);color:#fff">＋</button>'
@@ -529,8 +596,9 @@ function kidsView() {
   } else {
     h += DB.kids.map(function (k) {
       const n = kidMeasurements(k.id).length;
+      const photo = PHOTOS[k.id];
       return '<a class="kidrow" href="#" data-action="nav-kid" data-id="' + k.id + '">' +
-        '<span class="avatar">' + (k.sex === 'boy' ? '👦' : '👧') + '</span>' +
+        '<span class="avatar">' + (photo ? '<img src="' + photo + '" alt="">' : (k.sex === 'boy' ? '👦' : '👧')) + '</span>' +
         '<span><span class="name">' + esc(k.name) + '</span>' +
         '<div class="sub">' + esc(ageString(k.birth)) + ' old · ' + n + ' measurement' + (n === 1 ? '' : 's') + '</div></span>' +
         '<span class="chev">›</span></a>';
@@ -579,7 +647,7 @@ function kidView(kidId) {
   const ind = INDICATORS[tab];
   const ms = kidMeasurements(kidId).slice().reverse();
 
-  let h = topbar(kid.name, true);
+  let h = topbar(kid.name, true, 'nav-kids');
   h += '<div class="card"><div style="display:flex;align-items:center;gap:10px">' +
     '<div style="flex:1"><h3 style="font-size:17px">' + esc(ageString(kid.birth)) + ' old</h3>' +
     '<div class="small muted">Born ' + esc(fmtDate(kid.birth)) + ' · ' + (kid.sex === 'boy' ? 'Boy' : 'Girl') + '</div></div>' +
@@ -670,6 +738,7 @@ function settingsView() {
 /* ---------------- modals ---------------- */
 function kidModal(kidId) {
   const k = kidId ? getKid(kidId) : null;
+  const photo = (k && PHOTOS[k.id]) || null;
   return '<div class="modal-back" data-action="backdrop"><div class="modal" role="dialog">' +
     '<div class="grabber"></div><h2>' + (k ? 'Edit child' : 'Add child') + '</h2>' +
     '<form data-form="kid"><input type="hidden" name="id" value="' + (k ? k.id : '') + '">' +
@@ -678,6 +747,11 @@ function kidModal(kidId) {
     '<select name="sex"><option value="boy"' + (!k || k.sex === 'boy' ? ' selected' : '') + '>Boy</option>' +
     '<option value="girl"' + (k && k.sex === 'girl' ? ' selected' : '') + '>Girl</option></select></div>' +
     '<div class="field"><label>Birth date</label><input type="date" name="birth" required max="' + todayStr() + '" value="' + esc(k ? k.birth : '') + '"></div>' +
+    '<div class="field"><label>Photo <span class="hint">— stays on this device, never synced</span></label>' +
+    '<div class="photorow">' + photoPreviewHTML(photo) +
+    '<label class="btn ghost" style="cursor:pointer">Choose photo<input type="file" accept="image/*" data-change="photo" style="display:none"></label>' +
+    '<button type="button" class="btn ghost" data-action="remove-photo" data-photo-remove style="display:' + (photo ? '' : 'none') + '">Remove</button>' +
+    '</div></div>' +
     '<div class="ferr" data-err></div>' +
     '<div class="btnrow"><button type="button" class="btn ghost" data-action="close-modal">Cancel</button>' +
     '<button type="submit" class="btn primary">' + (k ? 'Save' : 'Add') + '</button></div>' +
@@ -752,14 +826,20 @@ function handleKidForm(form) {
   const birth = String(fd.get('birth') || '');
   if (!name) return formError(form, 'Give them a name first.');
   if (!birth) return formError(form, 'Pick a birth date.');
+  let kid = null;
   if (id) {
-    const k = getKid(id);
-    if (k) { k.name = name; k.sex = sex; k.birth = birth; k.updatedAt = Date.now(); }
+    kid = getKid(id);
+    if (kid) { kid.name = name; kid.sex = sex; kid.birth = birth; kid.updatedAt = Date.now(); }
   } else {
-    const k = { id: uid(), name: name, sex: sex, birth: birth, updatedAt: Date.now() };
-    DB.kids.push(k);
-    view = { name: 'kid', kidId: k.id, tab: 'weight' };
+    kid = { id: uid(), name: name, sex: sex, birth: birth, updatedAt: Date.now() };
+    DB.kids.push(kid);
+    view = { name: 'kid', kidId: kid.id, tab: 'weight' };
   }
+  if (kid && photoDraft !== undefined) {
+    if (photoDraft) PHOTOS[kid.id] = photoDraft; else delete PHOTOS[kid.id];
+    savePhotos();
+  }
+  photoDraft = undefined;
   modal = null; saveDB(); scheduleSync(); render();
 }
 function handleMsrForm(form) {
@@ -796,10 +876,11 @@ const Actions = {
   'nav-kids': function () { view = { name: 'kids' }; render(); },
   'nav-kid': function (d) { view = { name: 'kid', kidId: d.id, tab: 'weight' }; render(); window.scrollTo(0, 0); },
   'nav-settings': function () { view = { name: 'settings' }; render(); window.scrollTo(0, 0); },
-  'open-kid-modal': function (d) { modal = { type: 'kid', kidId: d.id || null }; render(); },
+  'open-kid-modal': function (d) { photoDraft = undefined; modal = { type: 'kid', kidId: d.id || null }; render(); },
   'open-msr-modal': function (d) { modal = { type: 'msr', kidId: d.kid, msrId: d.id || null }; render(); },
-  'close-modal': function () { modal = null; render(); },
-  'backdrop': function (d, el, e) { if (e.target === el) { modal = null; render(); } },
+  'close-modal': function () { photoDraft = undefined; modal = null; render(); },
+  'backdrop': function (d, el, e) { if (e.target === el) { photoDraft = undefined; modal = null; render(); } },
+  'remove-photo': function () { photoDraft = null; updatePhotoPreview(); },
   'set-tab': function (d) { view.tab = d.ind; view.selectedId = null; render(); },
   'select-point': function (d) {
     view.selectedId = view.selectedId === d.id ? null : d.id;
@@ -835,6 +916,7 @@ const Actions = {
     });
     DB.kids = DB.kids.filter(function (x) { return x.id !== d.id; });
     DB.measurements = DB.measurements.filter(function (x) { return x.kidId !== d.id; });
+    prunePhotos();
     modal = null; view = { name: 'kids' }; saveDB(); scheduleSync(); render();
   },
   'delete-msr': function (d) {
@@ -913,6 +995,7 @@ function handleImport(input) {
 if (typeof document !== 'undefined') {
   DB = loadDB();
   SYNC = loadSync();
+  PHOTOS = loadPhotos();
   document.addEventListener('click', function (e) {
     const el = e.target.closest('[data-action]');
     if (!el) return;
@@ -933,6 +1016,7 @@ if (typeof document !== 'undefined') {
     const el = e.target.closest('[data-change]');
     if (!el) return;
     if (el.dataset.change === 'import') handleImport(el);
+    else if (el.dataset.change === 'photo') handlePhotoInput(el);
     else if (el.dataset.change === 'msr-date') {
       const kidId = (document.querySelector('input[name="kidId"]') || {}).value;
       const kid = kidId && getKid(kidId);
