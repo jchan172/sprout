@@ -214,10 +214,18 @@ function mergeSnapshots(a, b) {
 
 let syncing = false;
 let syncTimer = 0;
+let syncPending = false; // local changes (or a failed sync) still need uploading
 function scheduleSync() {
   if (!SYNC.key || typeof fetch === 'undefined') return;
+  syncPending = true;
   clearTimeout(syncTimer);
   syncTimer = setTimeout(function () { syncNow(); }, 2500);
+}
+// True when a reconnect is a good moment to sync: something is waiting to go
+// up, or it's been a while since we last checked for remote changes.
+function needsSyncRetry() {
+  return !!SYNC.key && !syncing &&
+    (syncPending || Date.now() - SYNC.lastSyncedAt > 60000);
 }
 async function syncNow() {
   if (!SYNC.key || syncing || typeof fetch === 'undefined') return false;
@@ -238,12 +246,14 @@ async function syncNow() {
     if (!put.ok) throw new Error('put ' + put.status);
     applySnapshot(merged);
     SYNC.lastSyncedAt = Date.now(); saveSync();
+    syncPending = false;
     syncNote = '';
     // don't clobber a form the user is typing in; it re-renders on close
     if (!modal) render();
     return true;
   } catch (e) {
     syncNote = 'Sync failed — check your connection and try again.';
+    syncPending = true; // retry next time we're online / visible
     if (view.name === 'settings' && !modal) render();
     return false;
   } finally {
@@ -939,6 +949,10 @@ if (typeof document !== 'undefined') {
   });
   document.addEventListener('visibilitychange', function () {
     if (!document.hidden && SYNC.key && Date.now() - SYNC.lastSyncedAt > 60000) syncNow();
+  });
+  // Was offline (doctor's office, dead zone): push the moment we're back.
+  window.addEventListener('online', function () {
+    if (needsSyncRetry()) syncNow();
   });
   if ('serviceWorker' in navigator && /^https?:$/.test(location.protocol)) {
     window.addEventListener('load', function () {
