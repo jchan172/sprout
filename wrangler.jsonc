@@ -1,0 +1,15 @@
+{
+  // Cloudflare Worker config for Sprout.
+  // "name" must exactly match the Worker name shown in the Cloudflare dashboard
+  // (Workers & Pages → this project), or the build will fail.
+  "name": "sprout",
+  "main": "worker.js",
+  "compatibility_date": "2026-10-09",
+  "assets": {
+    // The PWA lives at the repo root; see .assetsignore for what's excluded.
+    "directory": "./",
+    "binding": "ASSETS",
+    // Make sure API requests always reach the Worker before asset matching.
+    "run_worker_first": ["/api/*"]
+  }
+}

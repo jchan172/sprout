@@ -7,8 +7,10 @@ curves. No App Store, no Apple Developer account, no build step.
 ## Getting it on your iPhone (2 minutes)
 
 **Option A — free hosting (recommended, works offline):**
-1. Sign up free at Cloudflare Pages, Netlify, or Vercel.
-2. Drag this whole folder into a new static site (or `npx vercel`).
+1. Sign up free at Cloudflare, Netlify, or Vercel.
+2. Drag this whole folder into a new static site (or `npx vercel`). Note: the
+   cross-device sync API needs the Cloudflare Worker (`worker.js` +
+   `wrangler.jsonc`); plain static hosts serve the tracker without sync.
 3. Open the URL in **Safari** on your iPhone → Share → **Add to Home Screen**.
 4. It now opens full-screen like a native app and works offline.
 
@@ -26,21 +28,22 @@ clobber each other. Your unit preference stays per-device.
 
 ### One-time Cloudflare setup
 
-**Important:** deploy the site *with* the `functions/` folder first — the sync
-API is a Pages Function, and Cloudflare only lets you add KV bindings once the
-project has a Function (otherwise you'll see "Bindings cannot be added to a
-Worker that only has static assets").
+The sync API is a **Worker** (`worker.js`) serving the static site plus
+`/api/sync/*`; `wrangler.jsonc` at the repo root wires it up for Workers
+Builds (deploy command `npx wrangler deploy`). The `"name"` in
+`wrangler.jsonc` must exactly match the Worker name in the dashboard, or the
+build fails.
 
 1. **Create a KV namespace:** Cloudflare dashboard → Workers & Pages → KV →
    **Create namespace**, name it e.g. `sprout-sync`.
-2. **Bind it to your Pages project:** open your Pages project → Settings →
-   **Bindings** → Add → **KV namespace**:
+2. **Bind it to your Worker:** open the Worker → Settings → **Bindings** →
+   Add → **KV namespace**:
    - Variable name: `SPROUT_KV`
    - Namespace: the one you just created
-3. **Redeploy your project** for the binding to take effect (required — bindings
-   only apply to new deployments).
+3. **Redeploy** for the binding to take effect (required — bindings only apply
+   to new deployments). Push any commit, or use Retry deployment.
 
-That's it. The API is two endpoints served by Pages Functions:
+That's it. The API is two endpoints served by the Worker:
 
 - `GET /api/sync/:key` → snapshot JSON or 404
 - `PUT /api/sync/:key` → stores a validated snapshot (5 MB cap)

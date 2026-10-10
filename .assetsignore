@@ -1,0 +1,8 @@
+# Files wrangler must never upload as public static assets (gitignore syntax).
+.git/
+.wrangler/
+wrangler.jsonc
+worker.js
+README.md
+units.test.cjs
+.DS_Store

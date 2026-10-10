@@ -146,10 +146,10 @@ function percentileOf(kid, msr, indKey) {
   return percentileFor(v, lms[0], lms[1], lms[2]);
 }
 
-/* ---------------- sync (Cloudflare KV via Pages Functions) ----------------
+/* ---------------- sync (Cloudflare Worker + KV) ----------------
    No database: the whole dataset is a small JSON snapshot stored under a
-   random sync key in Workers KV. Devices merge record-by-record using
-   updatedAt, so concurrent edits don't clobber each other. */
+   random sync key in Workers KV, served by worker.js. Devices merge
+   record-by-record using updatedAt, so concurrent edits don't clobber each other. */
 const SYNC_LS = 'sprout.sync.v1';
 let SYNC = { key: null, lastSyncedAt: 0 };
 let syncNote = ''; // transient status line for Settings
