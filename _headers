@@ -1,0 +1,8 @@
+# Never let the browser cache the service worker or entry page:
+# updates must be discovered on every launch.
+/sw.js
+  Cache-Control: no-cache
+/
+  Cache-Control: no-cache
+/index.html
+  Cache-Control: no-cache

@@ -1,5 +1,8 @@
-/* Sprout PWA service worker — cache-first offline support. */
-const CACHE = 'sprout-v2';
+/* Sprout PWA service worker.
+   App shell files (HTML/JS/CSS) are network-first so releases reach the phone
+   on the next launch; big immutable files stay cache-first. Offline falls back
+   to the cache either way. Bump CACHE when this file changes. */
+const CACHE = 'sprout-v3';
 const ASSETS = [
   './',
   './index.html',
@@ -33,13 +36,21 @@ self.addEventListener('fetch', function (e) {
   if (e.request.method !== 'GET') return;
   const url = new URL(e.request.url);
   if (url.pathname.indexOf('/api/') === 0) return; // sync API: always hit the network
+  // Files that change with releases: revalidate on every launch, cache as fallback.
+  const networkFirst = url.pathname === '/' || url.pathname === '/index.html' ||
+    url.pathname === '/app.js' || url.pathname === '/styles.css';
   e.respondWith(
     caches.match(e.request, { ignoreSearch: true }).then(function (hit) {
-      return hit || fetch(e.request).then(function (res) {
-        const copy = res.clone();
-        caches.open(CACHE).then(function (c) { c.put(e.request, copy); });
-        return res;
-      }).catch(function () { return caches.match('./index.html'); });
+      function network() {
+        return fetch(e.request).then(function (res) {
+          const copy = res.clone();
+          caches.open(CACHE).then(function (c) { c.put(e.request, copy); });
+          return res;
+        });
+      }
+      if (networkFirst) return network().catch(function () { return hit || caches.match('./index.html'); });
+      if (hit) return hit; // immutable assets: cache-first
+      return network().catch(function () { return caches.match('./index.html'); });
     })
   );
 });

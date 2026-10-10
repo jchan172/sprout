@@ -1040,7 +1040,15 @@ if (typeof document !== 'undefined') {
   });
   if ('serviceWorker' in navigator && /^https?:$/.test(location.protocol)) {
     window.addEventListener('load', function () {
-      navigator.serviceWorker.register('sw.js').catch(function () {});
+      const hadController = !!navigator.serviceWorker.controller;
+      navigator.serviceWorker.register('sw.js').then(function (reg) {
+        // Don't wait for the 24h update throttle — check for a new version now.
+        if (reg && reg.update) reg.update();
+      }).catch(function () {});
+      // A new service worker just took over: reload once so the new code runs.
+      navigator.serviceWorker.addEventListener('controllerchange', function () {
+        if (hadController && !modal) window.location.reload();
+      });
     });
   }
 }
