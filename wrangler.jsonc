@@ -5,6 +5,12 @@
   "name": "sprout",
   "main": "worker.js",
   "compatibility_date": "2026-10-09",
+  "kv_namespaces": [
+    {
+      "binding": "SPROUT_KV",
+      "id": "ca25bc1df45541ff966f8eaed4a46dc9"
+    }
+  ],
   "assets": {
     // The PWA lives at the repo root; see .assetsignore for what's excluded.
     "directory": "./",
