@@ -261,6 +261,166 @@ function syncStatusText() {
   return 'Synced ' + new Date(SYNC.lastSyncedAt).toLocaleString() + '.';
 }
 
+/* ---------------- Nara Baby CSV import/export ----------------
+   Sprout reads and writes the same 51-column CSV layout as Nara Baby's
+   activity export, so history can move between the two apps. Only Growth
+   rows carry measurements Sprout understands; other activity types are
+   skipped on import and never written on export. Values are stored in
+   canonical metric (KG/CM), matching Nara Baby's own export. */
+const NARA_COLS = [
+  'Type', 'Profile Name', 'Start Date/time', 'Start Date/time (Epoch)',
+  'Created By Caregiver', 'Last Updated By Caregiver', 'Note', 'Time Zone',
+  '[Growth] Head Size', '[Growth] Head Size Unit', '[Growth] Height', '[Growth] Height Unit',
+  '[Growth] Weight', '[Growth] Weight Unit',
+  '[Diaper] Type', '[Diaper] Detail', '[Diaper] Dirty Color', '[Diaper] Dirty Texture',
+  '[Sleep] Duration (Seconds)', '[Sleep] End Date/time', '[Sleep] End Date/time (Epoch)',
+  '[Routine] Routine',
+  '[Breastfeed] Begin Side', '[Breastfeed] End Side',
+  '[Breastfeed] Left Duration (Seconds)', '[Breastfeed] Right Duration (Seconds)',
+  '[Bottle Feed] Type', '[Bottle Feed] Breast Milk Volume', '[Bottle Feed] Breast Milk Volume Unit',
+  '[Bottle Feed] Formula Name', '[Bottle Feed] Formula Volume', '[Bottle Feed] Formula Volume Unit',
+  '[Bottle Feed] Volume', '[Bottle Feed] Volume Unit',
+  '[Vaccine] Vaccine',
+  '[Pump] Duration (Seconds)', '[Pump] End Date/time', '[Pump] End Date/time (Epoch)',
+  '[Pump] Left Volume', '[Pump] Left Volume Unit', '[Pump] Right Volume', '[Pump] Right Volume Unit',
+  '[Pump] Total Volume', '[Pump] Total Volume Unit',
+  '[Profile] Birth Date', '[Profile] Birth Date (Adjusted)', '[Profile] Sex', '[Profile] Type',
+  '_familyKey', '_profileKey', '_activityKey'
+];
+function parseCSV(text) {
+  const rows = [];
+  let row = [], field = '', inQ = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inQ) {
+      if (c === '"') {
+        if (text[i + 1] === '"') { field += '"'; i++; }
+        else inQ = false;
+      } else field += c;
+    } else if (c === '"') inQ = true;
+    else if (c === ',') { row.push(field); field = ''; }
+    else if (c === '\n') { row.push(field); rows.push(row); row = []; field = ''; }
+    else if (c !== '\r') field += c;
+  }
+  if (inQ || field !== '' || row.length) { row.push(field); rows.push(row); }
+  return rows;
+}
+function csvCell(v) {
+  return '"' + String(v == null ? '' : v).replace(/"/g, '""') + '"';
+}
+function csvNum(v) {
+  if (v == null || !isFinite(v)) return '';
+  return String(Number(v.toFixed(4)));
+}
+function naraWeightToKg(v, unit) {
+  const u = String(unit || 'KG').trim().toUpperCase();
+  if (u === 'KG' || u === 'KILOGRAM' || u === 'KILOGRAMS') return v;
+  if (u === 'G' || u === 'GRAM' || u === 'GRAMS') return v / 1000;
+  if (u === 'LB' || u === 'LBS' || u === 'POUND' || u === 'POUNDS') return v * 0.45359237;
+  if (u === 'OZ' || u === 'OUNCE' || u === 'OUNCES') return v * 0.028349523125;
+  return null; // unknown unit — don't guess
+}
+function naraLengthToCm(v, unit) {
+  const u = String(unit || 'CM').trim().toUpperCase();
+  if (u === 'CM' || u === 'CENTIMETER' || u === 'CENTIMETERS') return v;
+  if (u === 'MM' || u === 'MILLIMETER' || u === 'MILLIMETERS') return v / 10;
+  if (u === 'M' || u === 'METER' || u === 'METERS') return v * 100;
+  if (u === 'IN' || u === 'INCH' || u === 'INCHES') return v * 2.54;
+  if (u === 'FT' || u === 'FOOT' || u === 'FEET') return v * 30.48;
+  return null; // unknown unit — don't guess
+}
+function exportNaraCSV() {
+  const tz = (typeof Intl !== 'undefined' && Intl.DateTimeFormat)
+    ? (Intl.DateTimeFormat().resolvedOptions().timeZone || '') : '';
+  const lines = [NARA_COLS.map(csvCell).join(',')];
+  DB.kids.slice().sort(function (a, b) { return a.name < b.name ? -1 : a.name > b.name ? 1 : 0; })
+    .forEach(function (k) {
+      kidMeasurements(k.id).forEach(function (m) {
+        const r = new Array(NARA_COLS.length).fill('');
+        r[0] = 'Growth';
+        r[1] = k.name;
+        r[2] = m.date + ' 00:00:00';
+        r[3] = String(new Date(+m.date.slice(0, 4), +m.date.slice(5, 7) - 1, +m.date.slice(8, 10)).getTime());
+        r[7] = tz;
+        if (m.headCm != null) { r[8] = csvNum(m.headCm); r[9] = 'CM'; }
+        if (m.lengthCm != null) { r[10] = csvNum(m.lengthCm); r[11] = 'CM'; }
+        if (m.weightKg != null) { r[12] = csvNum(m.weightKg); r[13] = 'KG'; }
+        lines.push(r.map(csvCell).join(','));
+      });
+    });
+  return lines.join('\n') + '\n';
+}
+function importNaraCSV(text) {
+  const rows = parseCSV(text);
+  if (!rows.length) throw new Error('empty file');
+  const idx = {};
+  rows[0].forEach(function (c, i) {
+    const name = String(c).trim();
+    if (!(name in idx)) idx[name] = i;
+  });
+  if (idx['Type'] == null || idx['Profile Name'] == null) throw new Error('not a Nara Baby export');
+  function col(row, name) {
+    const i = idx[name];
+    return i == null ? '' : String(row[i] == null ? '' : row[i]).trim();
+  }
+  function parseVal(s) {
+    if (!s) return null;
+    const v = parseFloat(String(s).replace(',', '.'));
+    return isFinite(v) && v > 0 ? v : null;
+  }
+  function dateOf(row) {
+    const dtm = /^(\d{4}-\d{2}-\d{2})/.exec(col(row, 'Start Date/time') || '');
+    if (dtm) return dtm[1];
+    const ep = parseInt(col(row, 'Start Date/time (Epoch)'), 10);
+    if (isFinite(ep) && ep > 0 && typeof Intl !== 'undefined') {
+      try {
+        const parts = new Intl.DateTimeFormat('en-CA', {
+          timeZone: col(row, 'Time Zone') || undefined,
+          year: 'numeric', month: '2-digit', day: '2-digit'
+        }).format(new Date(ep));
+        if (/^\d{4}-\d{2}-\d{2}$/.test(parts)) return parts;
+      } catch (e) { /* fall through */ }
+    }
+    return null;
+  }
+  const now = Date.now();
+  const kidsByName = {};
+  DB.kids.forEach(function (k) { kidsByName[String(k.name).trim().toLowerCase()] = k; });
+  const byKey = {};
+  DB.measurements.forEach(function (m) { byKey[m.kidId + '|' + m.date] = m; });
+  let created = 0, updated = 0, skipped = 0;
+  const unmatched = {};
+  for (let i = 1; i < rows.length; i++) {
+    const row = rows[i];
+    if (!row.length || row.every(function (c) { return !String(c).trim(); })) continue;
+    if (col(row, 'Type').toLowerCase() !== 'growth') continue;
+    const kid = kidsByName[col(row, 'Profile Name').toLowerCase()];
+    if (!kid) { unmatched[col(row, 'Profile Name') || '(blank)'] = true; skipped++; continue; }
+    const date = dateOf(row);
+    if (!date) { skipped++; continue; }
+    const w = parseVal(col(row, '[Growth] Weight'));
+    const l = parseVal(col(row, '[Growth] Height'));
+    const hc = parseVal(col(row, '[Growth] Head Size'));
+    const wKg = w == null ? null : naraWeightToKg(w, col(row, '[Growth] Weight Unit'));
+    const lCm = l == null ? null : naraLengthToCm(l, col(row, '[Growth] Height Unit'));
+    const hcCm = hc == null ? null : naraLengthToCm(hc, col(row, '[Growth] Head Size Unit'));
+    if (wKg == null && lCm == null && hcCm == null) { skipped++; continue; }
+    const key = kid.id + '|' + date;
+    let m = byKey[key];
+    if (!m) {
+      m = { id: uid(), kidId: kid.id, date: date, weightKg: null, lengthCm: null, headCm: null, updatedAt: now };
+      DB.measurements.push(m);
+      byKey[key] = m;
+      created++;
+    } else updated++;
+    if (wKg != null) m.weightKg = wKg;
+    if (lCm != null) m.lengthCm = lCm;
+    if (hcCm != null) m.headCm = hcCm;
+    m.updatedAt = now;
+  }
+  return { created: created, updated: updated, skipped: skipped, unmatched: Object.keys(unmatched).sort() };
+}
+
 /* ---------------- view state ---------------- */
 let view = { name: 'kids' };
 let modal = null; // {type:'kid',kidId?} | {type:'msr',kidId,msrId?}
@@ -485,9 +645,9 @@ function settingsView() {
     '</div></div>';
   h += syncSection();
   h += '<div class="card"><h3>Backup</h3>' +
-    '<p class="small muted">Your data lives only in this browser. Export a backup before clearing site data or switching devices.</p>' +
-    '<div class="btnrow"><button class="btn ghost" data-action="export">Export JSON</button>' +
-    '<label class="btn ghost" style="text-align:center;cursor:pointer">Import JSON<input type="file" accept="application/json" data-change="import" style="display:none"></label></div></div>';
+    '<p class="small muted">Export uses the Nara Baby CSV format — good as a backup, and you can import a Nara Baby export here to bring your history into Sprout.</p>' +
+    '<div class="btnrow"><button class="btn ghost" data-action="export">Export CSV</button>' +
+    '<label class="btn ghost" style="text-align:center;cursor:pointer">Import CSV<input type="file" accept=".csv,text/csv" data-change="import" style="display:none"></label></div></div>';
   h += '<div class="card"><h3>Add to Home Screen</h3>' +
     '<p class="small muted">On iPhone: open this page in Safari → Share → <b>Add to Home Screen</b>. It then opens full-screen like an app and works offline.</p></div>';
   h += '<div class="card"><h3>Reference data</h3>' +
@@ -674,10 +834,10 @@ const Actions = {
     modal = null; saveDB(); scheduleSync(); render();
   },
   'export': function () {
-    const blob = new Blob([JSON.stringify(DB, null, 2)], { type: 'application/json' });
+    const blob = new Blob([exportNaraCSV()], { type: 'text/csv;charset=utf-8' });
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
-    a.download = 'sprout-backup-' + todayStr() + '.json';
+    a.download = 'sprout-export-' + todayStr() + '.csv';
     document.body.appendChild(a); a.click();
     setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 500);
   },
@@ -719,17 +879,21 @@ function handleImport(input) {
   const r = new FileReader();
   r.onload = function () {
     try {
-      const d = JSON.parse(r.result);
-      if (!d || !Array.isArray(d.kids) || !Array.isArray(d.measurements)) throw new Error('bad file');
-      DB = d;
-      if (DB.units !== 'metric' && DB.units !== 'imperial') DB.units = 'imperial';
-      if (!Array.isArray(DB.deleted)) DB.deleted = [];
-      const now = Date.now();
-      DB.kids.forEach(function (k) { if (!k.updatedAt) k.updatedAt = now; });
-      DB.measurements.forEach(function (m) { if (!m.updatedAt) m.updatedAt = now; });
+      const res = importNaraCSV(String(r.result));
       saveDB(); scheduleSync(); view = { name: 'kids' }; render();
-      alert('Backup imported.');
-    } catch (e) { alert("Couldn't read that backup file."); }
+      const parts = [];
+      if (res.created) parts.push(res.created + ' new');
+      if (res.updated) parts.push(res.updated + ' updated');
+      let msg = parts.length
+        ? 'Imported ' + parts.join(' and ') + ' measurement' + (res.created + res.updated === 1 ? '' : 's') + '.'
+        : 'No growth measurements found to import.';
+      if (res.unmatched.length) {
+        msg += ' No matching child for: ' + res.unmatched.join(', ') + ' — add them first, then import again.';
+      } else if (res.skipped) {
+        msg += ' Skipped ' + res.skipped + ' row' + (res.skipped === 1 ? '' : 's') + ' with no usable growth data.';
+      }
+      alert(msg);
+    } catch (e) { alert("Couldn't read that file — is it a Nara Baby CSV export?"); }
     input.value = '';
   };
   r.readAsText(f);

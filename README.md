@@ -61,7 +61,7 @@ no endpoint that lists keys — wrong keys just get a 404.
 
 Everything lives in your browser's **localStorage** — on your device only,
 nothing is uploaded anywhere. It persists across sessions like a native app's
-data. Use **Settings → Export JSON** for backups (and to move between devices).
+data. Use **Settings → Export CSV** for backups (Nara Baby-compatible format).
 
 ## Features
 
@@ -72,7 +72,7 @@ data. Use **Settings → Export JSON** for backups (and to move between devices)
 - Latest-percentile summary cards
 - Metric/imperial units (Settings)
 - Independent lb/kg and in/cm toggles when entering measurements; displays follow Settings
-- JSON export/import backup
+- CSV export/import in Nara Baby's format (import a Nara Baby export to migrate history)
 - Installable (manifest) + offline (service worker)
 
 ## Files
