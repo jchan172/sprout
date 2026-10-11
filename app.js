@@ -667,12 +667,16 @@ function kidView(kidId) {
     '<span><span class="dot" style="background:#1a73e8"></span>' + esc(kid.name) + '</span></div>';
   h += pointInfo(kid, tab, view.selectedId);
 
-  h += '<div class="sect-head"><h2>Measurements</h2>' +
+  h += '<div class="sect-head" id="msr-head"><h2>Measurements</h2>' +
     '<button class="iconbtn" data-action="open-msr-modal" data-kid="' + kid.id + '" aria-label="Add measurement" style="background:var(--green);color:#fff">＋</button></div>';
   if (!ms.length) {
     h += '<p class="small muted">No measurements yet.</p>';
   } else {
-    h += ms.map(function (m) {
+    const SHOW_N = 10;
+    const expanded = !!view.showAllMsr;
+    const hasMore = ms.length > SHOW_N;
+    const shown = expanded ? ms : ms.slice(0, SHOW_N);
+    h += '<div class="msr-wrap">' + shown.map(function (m) {
       const vals = IND_KEYS.map(function (key) {
         const v = INDICATORS[key].get(m);
         if (v == null) return '';
@@ -684,7 +688,11 @@ function kidView(kidId) {
         '<div><div class="date">' + esc(fmtDate(m.date)) + '</div>' +
         '<div class="age">' + esc(ageString(kid.birth, m.date)) + ' old</div></div>' +
         '<div class="vals">' + vals + '</div></div>';
-    }).join('');
+    }).join('') + (!expanded && hasMore ? '<div class="msr-fade"></div>' : '') + '</div>';
+    if (hasMore) {
+      h += '<button class="seemore" data-action="toggle-msr-list">' +
+        (expanded ? 'See Less <span>▴</span>' : 'See More <span>▾</span>') + '</button>';
+    }
   }
   h += '<p class="caption footnote">Reference: WHO Child Growth Standards (2006). For information only — not medical advice.</p>';
   return h;
@@ -885,6 +893,14 @@ const Actions = {
   'select-point': function (d) {
     view.selectedId = view.selectedId === d.id ? null : d.id;
     render();
+  },
+  'toggle-msr-list': function () {
+    view.showAllMsr = !view.showAllMsr;
+    render();
+    if (!view.showAllMsr) {
+      const el = document.getElementById('msr-head');
+      if (el && el.scrollIntoView) el.scrollIntoView();
+    }
   },
   'set-units': function (d) { DB.units = d.v === 'metric' ? 'metric' : 'imperial'; saveDB(); render(); },
   'set-input-unit': function (d, el) {
