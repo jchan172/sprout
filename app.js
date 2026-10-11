@@ -647,7 +647,9 @@ function kidView(kidId) {
   const ind = INDICATORS[tab];
   const ms = kidMeasurements(kidId).slice().reverse();
 
-  let h = topbar(kid.name, true, 'nav-kids');
+  let h = '<div class="topbar">' +
+    '<h1 class="kidcycle" data-action="cycle-kid" aria-label="Switch child">' + esc(kid.name) + ' <span class="cycledown">▾</span></h1>' +
+    '<button class="iconbtn" data-action="nav-kids" aria-label="Home">⌂</button></div>';
   h += '<div class="card"><div style="display:flex;align-items:center;gap:10px">' +
     '<div style="flex:1"><h3 style="font-size:17px">' + esc(ageString(kid.birth)) + ' old</h3>' +
     '<div class="small muted">Born ' + esc(fmtDate(kid.birth)) + ' · ' + (kid.sex === 'boy' ? 'Boy' : 'Girl') + '</div></div>' +
@@ -883,6 +885,14 @@ function handleMsrForm(form) {
 const Actions = {
   'nav-kids': function () { view = { name: 'kids' }; render(); },
   'nav-kid': function (d) { view = { name: 'kid', kidId: d.id, tab: 'weight' }; render(); window.scrollTo(0, 0); },
+  'cycle-kid': function () {
+    const ids = DB.kids.map(function (k) { return k.id; });
+    view.kidId = ids[(ids.indexOf(view.kidId) + 1) % ids.length];
+    view.selectedId = null;
+    view.showAllMsr = false;
+    render();
+    window.scrollTo(0, 0);
+  },
   'nav-settings': function () { view = { name: 'settings' }; render(); window.scrollTo(0, 0); },
   'open-kid-modal': function (d) { photoDraft = undefined; modal = { type: 'kid', kidId: d.id || null }; render(); },
   'open-msr-modal': function (d) { modal = { type: 'msr', kidId: d.kid, msrId: d.id || null }; render(); },
