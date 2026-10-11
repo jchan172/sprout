@@ -77,6 +77,72 @@ function ordinal(p) {
 /* ---------------- units ---------------- */
 function units() { return DB.units === 'metric' ? 'metric' : 'imperial'; }
 
+/* ---------------- growth reference datasets ---------------- */
+const DATASETS = [
+  { id: 'who', name: 'WHO 2006' },
+  { id: 'cn', name: 'China WS/T 423-2022' }
+];
+const DS_LS = 'sprout.dataset.v1';
+function dataset() { // device-local display preference, like units/theme
+  try { if (localStorage.getItem(DS_LS) === 'cn') return 'cn'; } catch (e) {}
+  return 'who';
+}
+function setDataset(id) {
+  try { localStorage.setItem(DS_LS, id === 'cn' ? 'cn' : 'who'); } catch (e) {}
+  render();
+}
+function cycleDataset(dir) {
+  const ids = DATASETS.map(function (d) { return d.id; });
+  setDataset(ids[(ids.indexOf(dataset()) + dir + ids.length) % ids.length]);
+}
+
+/* China WS/T 423-2022: monthly percentile tables (see china-data.js).
+   Rows: [ageMonths, P3, P10, P25, P50, P75, P90, P97]. */
+const CN_PCTS = [3, 10, 25, 50, 75, 90, 97];
+function cnRows(indKey, sex) {
+  const t = (typeof CN !== 'undefined' && CN[{ weight: 'weight', length: 'length', head: 'head' }[indKey]]) || null;
+  return (t && t[sex]) || null;
+}
+function cnRowAt(rows, mo) { // percentile values interpolated to exact age
+  const n = rows.length;
+  if (mo <= rows[0][0]) return rows[0].slice(1);
+  if (mo >= rows[n - 1][0]) return rows[n - 1].slice(1);
+  let lo = 0, hi = n - 1;
+  while (hi - lo > 1) { const mid = (lo + hi) >> 1; if (rows[mid][0] <= mo) lo = mid; else hi = mid; }
+  const a = rows[lo], b = rows[hi], f = (mo - a[0]) / (b[0] - a[0]);
+  const out = [];
+  for (let k = 1; k <= 7; k++) out.push(a[k] + (b[k] - a[k]) * f);
+  return out;
+}
+function cnPercentile(sex, indKey, day, v) {
+  const rows = cnRows(indKey, sex);
+  if (!rows || day < 0 || v == null) return null;
+  const mo = day / DAYS_PER_MONTH;
+  if (mo > rows[rows.length - 1][0]) return null;
+  const vals = cnRowAt(rows, mo), P = CN_PCTS;
+  if (v <= vals[0]) return Math.max(0.1, P[0] + (v - vals[0]) * (P[1] - P[0]) / (vals[1] - vals[0]));
+  for (let i = 0; i < 6; i++) {
+    if (v <= vals[i + 1]) return P[i] + (v - vals[i]) * (P[i + 1] - P[i]) / (vals[i + 1] - vals[i]);
+  }
+  return Math.min(99.9, P[6] + (v - vals[6]) * (P[6] - P[5]) / (vals[6] - vals[5]));
+}
+function cnCurveValue(sex, indKey, day, pct) { // pct in {3,15,50,85,97}
+  const rows = cnRows(indKey, sex);
+  if (!rows || day < 0) return null;
+  const mo = day / DAYS_PER_MONTH;
+  if (mo > rows[rows.length - 1][0]) return null;
+  const vals = cnRowAt(rows, mo);
+  const i = CN_PCTS.indexOf(pct);
+  if (i >= 0) return vals[i];
+  const lo = pct < 50 ? 1 : 4, hi = pct < 50 ? 2 : 5; // 15 between P10/P25, 85 between P75/P90
+  return vals[lo] + (vals[hi] - vals[lo]) * (pct - CN_PCTS[lo]) / (CN_PCTS[hi] - CN_PCTS[lo]);
+}
+function curveValueAt(indKey, sex, day, z) {
+  if (dataset() === 'cn') return cnCurveValue(sex, indKey, day, Math.round(phi(z) * 100));
+  const lms = lmsAt(indKey, sex, day);
+  return lms ? curveValue(z, lms[0], lms[1], lms[2]) : null;
+}
+
 /* ---------------- theme (device-local, never synced) ---------------- */
 const THEME_LS = 'sprout.theme.v1';
 function theme() {
@@ -156,6 +222,7 @@ function percentileOf(kid, msr, indKey) {
   const v = INDICATORS[indKey].get(msr);
   if (v == null) return null;
   const day = ageDays(kid.birth, msr.date);
+  if (dataset() === 'cn') return cnPercentile(kid.sex, indKey, day, v);
   const lms = lmsAt(indKey, kid.sex, day);
   if (!lms) return null;
   return percentileFor(v, lms[0], lms[1], lms[2]);
@@ -535,10 +602,11 @@ function chartSVG(kid, indKey, selectedId) {
   const series = CURVES.map(function (c) {
     const pts = [];
     for (let d = 0; d <= WHO_MAX_DAYS; d += 16) {
-      const lms = lmsAt(indKey, kid.sex, d);
-      pts.push([d / DAYS_PER_MONTH, toDisp(curveValue(c.z, lms[0], lms[1], lms[2]))]);
+      const v = curveValueAt(indKey, kid.sex, d, c.z);
+      pts.push(v == null ? null : [d / DAYS_PER_MONTH, toDisp(v)]);
     }
-    return { label: c.label, pts: pts };
+    const cut = pts.findIndex(function (p) { return p === null; }); // trailing gap: dataset ends (e.g. CN head at 36mo)
+    return { label: c.label, pts: cut < 0 ? pts : pts.slice(0, cut) };
   });
   const p3 = series[0].pts, p97 = series[4].pts;
   let lo = Infinity, hi = -Infinity;
@@ -670,6 +738,12 @@ function kidView(kidId) {
     '<div class="small muted">Born ' + esc(fmtDate(kid.birth)) + ' · ' + (kid.sex === 'boy' ? 'Boy' : 'Girl') + '</div></div>' +
     '<button class="btn ghost" data-action="open-kid-modal" data-id="' + kid.id + '">Edit</button>' +
     '</div></div>';
+  h += '<div class="ds-switch"><select data-change="dataset" aria-label="Growth reference">' +
+    DATASETS.map(function (d) {
+      return '<option value="' + d.id + '"' + (dataset() === d.id ? ' selected' : '') + '>' + esc(d.name) + '</option>';
+    }).join('') + '</select>' +
+    '<button class="iconbtn" data-action="ds-prev" aria-label="Previous reference">▲</button>' +
+    '<button class="iconbtn" data-action="ds-next" aria-label="Next reference">▼</button></div>';
 
   h += statCards(kid, tab);
 
@@ -711,7 +785,9 @@ function kidView(kidId) {
         (expanded ? 'See Less <span>▴</span>' : 'See More <span>▾</span>') + '</button>';
     }
   }
-  h += '<p class="caption footnote">Reference: WHO Child Growth Standards (2006). For information only — not medical advice.</p>';
+  h += '<p class="caption footnote">Reference: ' + (dataset() === 'cn'
+    ? 'WS/T 423-2022 Growth Standard for Children Under 7 Years (China NHC).'
+    : 'WHO Child Growth Standards (2006).') + ' For information only — not medical advice.</p>';
   return h;
 }
 
@@ -913,6 +989,9 @@ const Actions = {
     render();
     window.scrollTo(0, 0);
   },
+  'set-dataset': function (d) { setDataset(d.v); },
+  'ds-prev': function () { cycleDataset(-1); },
+  'ds-next': function () { cycleDataset(1); },
   'nav-settings': function () { view = { name: 'settings' }; render(); window.scrollTo(0, 0); },
   'open-kid-modal': function (d) { photoDraft = undefined; modal = { type: 'kid', kidId: d.id || null }; render(); },
   'open-msr-modal': function (d) { modal = { type: 'msr', kidId: d.kid, msrId: d.id || null }; render(); },
@@ -1075,6 +1154,7 @@ if (typeof document !== 'undefined') {
     if (!el) return;
     if (el.dataset.change === 'import') handleImport(el);
     else if (el.dataset.change === 'photo') handlePhotoInput(el);
+    else if (el.dataset.change === 'dataset') setDataset(el.value);
     else if (el.dataset.change === 'msr-date') {
       const kidId = (document.querySelector('input[name="kidId"]') || {}).value;
       const kid = kidId && getKid(kidId);
