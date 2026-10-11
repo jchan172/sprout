@@ -1,8 +1,20 @@
 # Sprout PWA — Baby Growth Tracker
 
-A no-install web app that tracks your kids' **weight**, **length/height**, and
+A no-install progressive web app that tracks your kids' **weight**, **length/height**, and
 **head circumference** against **WHO Child Growth Standards (2006)** percentile
-curves. No App Store, no Apple Developer account, no build step.
+curves. No App Store, no Apple Developer account, no build step. Not meant to scale though, as it saves and syncs (if you set up sync) using a small key/value store.
+
+## Features
+
+- Multiple children (name, sex, birth date)
+- Measurements by date: weight, length, head circumference (any subset)
+- SVG growth charts with WHO 3rd/15th/50th/85th/97th percentile curves,
+  birth–5 years, sex-specific; tap a point for date, age, value, percentile
+- Latest-percentile summary cards
+- Metric/imperial units (Settings)
+- Independent lb/kg and in/cm toggles when entering measurements; displays follow Settings
+- CSV export/import in Nara Baby's format (import a Nara Baby export to migrate history)
+- Installable (manifest) + offline (service worker)
 
 ## Getting it on your iPhone (2 minutes)
 
@@ -34,11 +46,11 @@ Builds (deploy command `npx wrangler deploy`). The `"name"` in
 `wrangler.jsonc` must exactly match the Worker name in the dashboard, or the
 build fails.
 
-1. **Create a KV namespace:** Cloudflare dashboard → Workers & Pages → KV →
+1. **Create a KV namespace:** Cloudflare dashboard → Storage & databases → Workers KV →
    **Create namespace**, name it e.g. `sprout-sync`.
 2. **Bind it to your Worker:** open the Worker → Settings → **Bindings** →
    Add → **KV namespace**:
-   - Variable name: `SPROUT_KV`
+   - Variable name: `SPROUT_KV` (must be exact, as this is referenced in code)
    - Namespace: the one you just created
 3. **Redeploy** for the binding to take effect (required — bindings only apply
    to new deployments). Push any commit, or use Retry deployment.
@@ -66,18 +78,6 @@ Everything lives in your browser's **localStorage** — on your device only,
 nothing is uploaded anywhere. It persists across sessions like a native app's
 data. Use **Settings → Export CSV** for backups (Nara Baby-compatible format).
 
-## Features
-
-- Multiple children (name, sex, birth date)
-- Measurements by date: weight, length, head circumference (any subset)
-- SVG growth charts with WHO 3rd/15th/50th/85th/97th percentile curves,
-  birth–5 years, sex-specific; tap a point for date, age, value, percentile
-- Latest-percentile summary cards
-- Metric/imperial units (Settings)
-- Independent lb/kg and in/cm toggles when entering measurements; displays follow Settings
-- CSV export/import in Nara Baby's format (import a Nara Baby export to migrate history)
-- Installable (manifest) + offline (service worker)
-
 ## Files
 
 | File | What |
@@ -99,4 +99,3 @@ Percentiles use the LMS method: `z = (((X/M)^L) − 1) / (L·S)`,
 `percentile = Φ(z) × 100`, with day-level WHO tables bundled in `who-data.js`.
 
 *For information only — not medical advice.*
-# sprout
