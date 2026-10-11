@@ -78,12 +78,15 @@ function ordinal(p) {
 function units() { return DB.units === 'metric' ? 'metric' : 'imperial'; }
 
 /* ---------------- growth reference datasets ---------------- */
+// Flip to true to expose the WS/T 423-2022 reference switcher on kid pages.
+const SHOW_DATASET_SWITCHER = false;
 const DATASETS = [
   { id: 'who', name: 'WHO 2006' },
   { id: 'cn', name: 'China WS/T 423-2022' }
 ];
 const DS_LS = 'sprout.dataset.v1';
 function dataset() { // device-local display preference, like units/theme
+  if (!SHOW_DATASET_SWITCHER) return 'who';
   try { if (localStorage.getItem(DS_LS) === 'cn') return 'cn'; } catch (e) {}
   return 'who';
 }
@@ -738,12 +741,14 @@ function kidView(kidId) {
     '<div class="small muted">Born ' + esc(fmtDate(kid.birth)) + ' · ' + (kid.sex === 'boy' ? 'Boy' : 'Girl') + '</div></div>' +
     '<button class="btn ghost" data-action="open-kid-modal" data-id="' + kid.id + '">Edit</button>' +
     '</div></div>';
-  h += '<div class="ds-switch"><select data-change="dataset" aria-label="Growth reference">' +
-    DATASETS.map(function (d) {
-      return '<option value="' + d.id + '"' + (dataset() === d.id ? ' selected' : '') + '>' + esc(d.name) + '</option>';
-    }).join('') + '</select>' +
-    '<button class="iconbtn" data-action="ds-prev" aria-label="Previous reference">▲</button>' +
-    '<button class="iconbtn" data-action="ds-next" aria-label="Next reference">▼</button></div>';
+  if (SHOW_DATASET_SWITCHER) {
+    h += '<div class="ds-switch"><select data-change="dataset" aria-label="Growth reference">' +
+      DATASETS.map(function (d) {
+        return '<option value="' + d.id + '"' + (dataset() === d.id ? ' selected' : '') + '>' + esc(d.name) + '</option>';
+      }).join('') + '</select>' +
+      '<button class="iconbtn" data-action="ds-prev" aria-label="Previous reference">▲</button>' +
+      '<button class="iconbtn" data-action="ds-next" aria-label="Next reference">▼</button></div>';
+  }
 
   h += statCards(kid, tab);
 
