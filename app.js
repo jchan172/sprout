@@ -76,6 +76,21 @@ function ordinal(p) {
 
 /* ---------------- units ---------------- */
 function units() { return DB.units === 'metric' ? 'metric' : 'imperial'; }
+
+/* ---------------- theme (device-local, never synced) ---------------- */
+const THEME_LS = 'sprout.theme.v1';
+function theme() {
+  const t = localStorage.getItem(THEME_LS);
+  return t === 'light' || t === 'dark' ? t : 'system';
+}
+function applyTheme() {
+  const t = theme();
+  const dark = t === 'dark' ||
+    (t === 'system' && typeof window !== 'undefined' && window.matchMedia &&
+      window.matchMedia('(prefers-color-scheme: dark)').matches);
+  const root = document.documentElement;
+  if (root) root.setAttribute('data-theme', dark ? 'dark' : 'light');
+}
 function dispWeight(kg) { return units() === 'metric' ? kg : kg * 2.20462; }
 function dispLength(cm) { return units() === 'metric' ? cm : cm / 2.54; }
 function toKg(v, unit) { return (unit || weightUnit()) === 'kg' ? v : v / 2.20462; }
@@ -541,13 +556,13 @@ function chartSVG(kid, indKey, selectedId) {
   s += '<path d="' + band + '" fill="#1a73e8" opacity="0.06"/>';
   // gridlines + y labels
   niceTicks(lo + pad, hi - pad, 5).forEach(function (t) {
-    s += '<line x1="' + PL + '" y1="' + f1(Y(t)) + '" x2="' + (W - PR) + '" y2="' + f1(Y(t)) + '" stroke="#e5e7eb"/>';
-    s += '<text x="' + (PL - 7) + '" y="' + f1(Y(t) + 4) + '" text-anchor="end" font-size="11" fill="#6b7280">' + Math.round(t) + '</text>';
+    s += '<line x1="' + PL + '" y1="' + f1(Y(t)) + '" x2="' + (W - PR) + '" y2="' + f1(Y(t)) + '" class="cgrid"/>';
+    s += '<text x="' + (PL - 7) + '" y="' + f1(Y(t) + 4) + '" text-anchor="end" font-size="11" class="caxis">' + Math.round(t) + '</text>';
   });
   // x labels
   for (let m = 0; m <= 60; m += 6) {
     const lbl = m === 0 ? 'Birth' : (m % 12 === 0 ? (m / 12) + 'y' : m + 'm');
-    s += '<text x="' + f1(X(m)) + '" y="' + (H - 12) + '" text-anchor="middle" font-size="11" fill="#6b7280">' + lbl + '</text>';
+    s += '<text x="' + f1(X(m)) + '" y="' + (H - 12) + '" text-anchor="middle" font-size="11" class="caxis">' + lbl + '</text>';
   }
   // curves
   const colors = { '3rd': '#9aa0a6', '15th': '#80868b', '50th': '#2f9e44', '85th': '#80868b', '97th': '#9aa0a6' };
@@ -736,6 +751,11 @@ function settingsView() {
     '<p class="small muted">Export uses the Nara Baby CSV format — good as a backup, and you can import a Nara Baby export here to bring your history into Sprout.</p>' +
     '<div class="btnrow"><button class="btn ghost" data-action="export">Export CSV</button>' +
     '<label class="btn ghost" style="text-align:center;cursor:pointer">Import CSV<input type="file" accept=".csv,text/csv" data-change="import" style="display:none"></label></div></div>';
+  h += '<div class="card"><h3>Appearance</h3><div class="seg" style="margin-top:8px">' +
+    ['system', 'light', 'dark'].map(function (t) {
+      return '<button class="' + (theme() === t ? 'active' : '') + '" data-action="set-theme" data-v="' + t + '">' +
+        t.charAt(0).toUpperCase() + t.slice(1) + '</button>';
+    }).join('') + '</div></div>';
   h += '<div class="card"><h3>Add to Home Screen</h3>' +
     '<p class="small muted">On iPhone: open this page in Safari → Share → <b>Add to Home Screen</b>. It then opens full-screen like an app and works offline.</p></div>';
   h += '<div class="card"><h3>Reference data</h3>' +
@@ -913,6 +933,11 @@ const Actions = {
     }
   },
   'set-units': function (d) { DB.units = d.v === 'metric' ? 'metric' : 'imperial'; saveDB(); render(); },
+  'set-theme': function (d) {
+    localStorage.setItem(THEME_LS, d.v === 'light' || d.v === 'dark' ? d.v : 'system');
+    applyTheme();
+    render();
+  },
   'set-input-unit': function (d, el) {
     const form = el.closest('form');
     const input = form.elements[d.field];
@@ -1022,6 +1047,13 @@ if (typeof document !== 'undefined') {
   DB = loadDB();
   SYNC = loadSync();
   PHOTOS = loadPhotos();
+  applyTheme();
+  if (window.matchMedia) {
+    const mq = window.matchMedia('(prefers-color-scheme: dark)');
+    const onChange = function () { applyTheme(); };
+    if (mq.addEventListener) mq.addEventListener('change', onChange);
+    else if (mq.addListener) mq.addListener(onChange);
+  }
   document.addEventListener('click', function (e) {
     const el = e.target.closest('[data-action]');
     if (!el) return;
