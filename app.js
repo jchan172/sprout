@@ -581,7 +581,7 @@ function topbar(title, back, titleAction) {
     (back ? '<a class="back" href="#" data-action="nav-kids" aria-label="Back">‹</a>' : '') +
     '<h1' + (titleAction ? ' data-action="' + titleAction + '" style="cursor:pointer"' : '') + '>' + esc(title) + '</h1>' +
     (view.name === 'kids'
-      ? '<button class="iconbtn" data-action="nav-settings" aria-label="Settings">⚙️</button>'
+      ? '<button class="iconbtn settingsbtn" data-action="nav-settings" aria-label="Settings"><span aria-hidden="true">&#x2699;&#xFE0E;</span></button>'
         + '<button class="iconbtn" data-action="open-kid-modal" aria-label="Add child" style="background:var(--green);color:#fff">＋</button>'
       : '') +
     '</div>';
@@ -648,7 +648,7 @@ function kidView(kidId) {
   const ms = kidMeasurements(kidId).slice().reverse();
 
   let h = '<div class="topbar">' +
-    '<h1 class="kidcycle" data-action="cycle-kid" aria-label="Switch child">' + esc(kid.name) + ' <span class="cycledown">⌄</span></h1>' +
+    '<h1 class="kidcycle" data-action="cycle-kid" aria-label="Switch child">' + esc(kid.name) + '<svg class="cycledown" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m4 8 8 8 8-8"/></svg></h1>' +
     '<button class="homebtn" data-action="nav-kids" aria-label="Home"><svg viewBox="0 0 24 24" width="30" height="30" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 11.2 12 4l9 7.2"/><path d="M5.6 9.8V20h12.8V9.8"/><path d="M10 20v-5.2h4V20"/></svg></button></div>';
   h += '<div class="card"><div style="display:flex;align-items:center;gap:10px">' +
     '<div style="flex:1"><h3 style="font-size:17px">' + esc(ageString(kid.birth)) + ' old</h3>' +
